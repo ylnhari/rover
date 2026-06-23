@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,37 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrPortInUse is returned by Start when the requested port is already taken by
+// another process, so callers can prompt for a one-off alternative port.
+var ErrPortInUse = errors.New("port already in use")
+
+// composeStartCmd injects the chosen port into a project's start command.
+// A "{port}" placeholder is substituted; otherwise, if the command doesn't
+// already mention --port, "--port <port>" is appended. With no port (<=0) the
+// command is returned unchanged.
+func composeStartCmd(startCmd string, port int) string {
+	if port <= 0 {
+		return startCmd
+	}
+	if strings.Contains(startCmd, "{port}") {
+		return strings.ReplaceAll(startCmd, "{port}", strconv.Itoa(port))
+	}
+	if strings.Contains(startCmd, "--port") {
+		return startCmd
+	}
+	return fmt.Sprintf("%s --port %d", startCmd, port)
+}
+
+// portAvailable reports whether a TCP port on localhost is free to bind.
+func portAvailable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
 
 type ProjectInfo struct {
 	Name        string `json:"name"`
@@ -135,7 +167,11 @@ func (m *Manager) Scan() []ProjectInfo {
 	return result
 }
 
-func (m *Manager) Start(name string) error {
+// Start launches a project. portOverride (>0) overrides the registered default
+// port for this run only; 0 uses the project's registered port. If a port is
+// known it is supplied to the server via composeStartCmd and is checked for
+// availability first — Start returns ErrPortInUse if it is already taken.
+func (m *Manager) Start(name string, portOverride int) error {
 	m.mu.Lock()
 	if _, ok := m.procs[name]; ok {
 		m.mu.Unlock()
@@ -157,6 +193,20 @@ func (m *Manager) Start(name string) error {
 		return fmt.Errorf("project %q not found", name)
 	}
 
+	port := proj.Port
+	if portOverride > 0 {
+		port = portOverride
+	}
+	if port > 0 && !portAvailable(port) {
+		return fmt.Errorf("%w: %d", ErrPortInUse, port)
+	}
+
+	startCmd := composeStartCmd(proj.StartCmd, port)
+	url := proj.URL
+	if url == "" && port > 0 {
+		url = fmt.Sprintf("http://127.0.0.1:%d", port)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var shell, flag string
@@ -166,7 +216,7 @@ func (m *Manager) Start(name string) error {
 		shell, flag = "sh", "-c"
 	}
 
-	cmd := exec.CommandContext(ctx, shell, flag, proj.StartCmd)
+	cmd := exec.CommandContext(ctx, shell, flag, startCmd)
 	cmd.Dir = proj.Path
 
 	setProcessGroup(cmd)
@@ -196,8 +246,8 @@ func (m *Manager) Start(name string) error {
 		info: RunningProject{
 			Name:      name,
 			StartTime: time.Now(),
-			Port:      proj.Port,
-			URL:       proj.URL,
+			Port:      port,
+			URL:       url,
 		},
 		cmd:    cmd,
 		done:   make(chan struct{}),
@@ -556,12 +606,16 @@ func (m *Manager) ValidateProject(dir, startCmd string) (int, string, error) {
 	}
 }
 
-func (m *Manager) AddProject(name, startCmd string) (*ProjectInfo, error) {
-	dir := filepath.Join(m.projectsRoot, name)
-	port, url, err := m.ValidateProject(dir, startCmd)
-	if err != nil {
-		return nil, err
+// AddProject registers a project at a user-supplied port. The raw startCmd is
+// stored without the port; rover supplies it at launch via composeStartCmd, so
+// the port can be changed later without rewriting the command. The project is
+// validated by briefly launching it (on the given port) and confirming it
+// prints a URL.
+func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, error) {
+	if port <= 0 {
+		return nil, fmt.Errorf("a port is required")
 	}
+	dir := filepath.Join(m.projectsRoot, name)
 
 	reg := loadRoverRegistry(m.registryPath)
 	if reg.Projects == nil {
@@ -569,6 +623,19 @@ func (m *Manager) AddProject(name, startCmd string) (*ProjectInfo, error) {
 	}
 	if _, ok := reg.Projects[name]; ok {
 		return nil, fmt.Errorf("project %q already exists in rover registry", name)
+	}
+	for _, p := range reg.Projects {
+		if p.Port == port {
+			return nil, fmt.Errorf("port %d is already assigned to project %q", port, p.Name)
+		}
+	}
+
+	_, url, err := m.ValidateProject(dir, composeStartCmd(startCmd, port))
+	if err != nil {
+		return nil, err
+	}
+	if url == "" {
+		url = fmt.Sprintf("http://127.0.0.1:%d", port)
 	}
 
 	p := ProjectInfo{
@@ -581,6 +648,30 @@ func (m *Manager) AddProject(name, startCmd string) (*ProjectInfo, error) {
 	}
 	reg.Projects[name] = p
 
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// UpdateProjectPort changes a project's registered default port.
+func (m *Manager) UpdateProjectPort(name string, port int) (*ProjectInfo, error) {
+	if port <= 0 {
+		return nil, fmt.Errorf("port must be greater than 0")
+	}
+	reg := loadRoverRegistry(m.registryPath)
+	p, ok := reg.Projects[name]
+	if !ok {
+		return nil, fmt.Errorf("project %q not found", name)
+	}
+	for _, other := range reg.Projects {
+		if other.Name != name && other.Port == port {
+			return nil, fmt.Errorf("port %d is already assigned to project %q", port, other.Name)
+		}
+	}
+	p.Port = port
+	p.URL = fmt.Sprintf("http://127.0.0.1:%d", port)
+	reg.Projects[name] = p
 	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
 		return nil, err
 	}

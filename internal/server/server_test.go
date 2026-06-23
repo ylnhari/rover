@@ -573,7 +573,7 @@ func TestAddAndRemoveProject(t *testing.T) {
 	_ = shell
 	_ = flag
 
-	body := fmt.Sprintf(`{"name":"testapp","start_cmd":"%s"}`, startCmd)
+	body := fmt.Sprintf(`{"name":"testapp","start_cmd":"%s","port":9999}`, startCmd)
 	resp := postJSON(t, ts.URL+"/api/projects", body, token)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {

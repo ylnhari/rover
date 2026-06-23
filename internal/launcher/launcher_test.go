@@ -1,7 +1,9 @@
 package launcher
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -184,7 +186,7 @@ func TestAddProject(t *testing.T) {
 	m := NewManager(dir)
 	m.registryPath = filepath.Join(dir, "registry.json")
 
-	proj, err := m.AddProject("nonexistent", "nonexistent_cmd")
+	proj, err := m.AddProject("nonexistent", "nonexistent_cmd", 9999)
 	if err == nil {
 		t.Fatal("expected error for nonexistent project directory")
 	}
@@ -202,7 +204,7 @@ func TestAddProject(t *testing.T) {
 		startCmd = `sh -c 'echo http://127.0.0.1:9999'`
 	}
 
-	proj, err = m.AddProject("testapp", startCmd)
+	proj, err = m.AddProject("testapp", startCmd, 9999)
 	if err != nil {
 		t.Fatalf("AddProject failed: %v", err)
 	}
@@ -233,7 +235,7 @@ func TestRemoveProject(t *testing.T) {
 		startCmd = `sh -c 'echo http://127.0.0.1:9999'`
 	}
 
-	m.AddProject("testapp", startCmd)
+	m.AddProject("testapp", startCmd, 9999)
 
 	err := m.RemoveProject("testapp")
 	if err != nil {
@@ -267,19 +269,27 @@ func TestStartStopProject(t *testing.T) {
 
 	var startCmd string
 	if isWindows() {
-		startCmd = `cmd /C echo server started && ping -n 30 127.0.0.1 >nul`
+		startCmd = `cmd /C echo server started {port} && ping -n 30 127.0.0.1 >nul`
 	} else {
-		startCmd = `sh -c 'echo server started && sleep 30'`
+		startCmd = `sh -c 'echo server started {port} && sleep 30'`
 	}
 
+	// pick a port that's actually free on this machine
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freePort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
 	reg := roverRegistry{Projects: map[string]ProjectInfo{
-		"echoserver": {Name: "echoserver", Path: appDir, StartCmd: startCmd, Port: 1234},
+		"echoserver": {Name: "echoserver", Path: appDir, StartCmd: startCmd, Port: freePort},
 	}}
 	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := m.Start("echoserver"); err != nil {
+	if err := m.Start("echoserver", 0); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
 
@@ -326,12 +336,12 @@ func TestStartAlreadyRunning(t *testing.T) {
 	}}
 	saveRoverRegistry(m.registryPath, reg)
 
-	if err := m.Start("echo"); err != nil {
+	if err := m.Start("echo", 0); err != nil {
 		t.Fatal(err)
 	}
 	defer m.Stop("echo")
 
-	err := m.Start("echo")
+	err := m.Start("echo", 0)
 	if err == nil {
 		t.Error("expected error starting already running project")
 	}
@@ -342,7 +352,7 @@ func TestStartNonexistent(t *testing.T) {
 	m := NewManager(dir)
 	m.registryPath = filepath.Join(dir, "registry.json")
 
-	err := m.Start("doesnotexist")
+	err := m.Start("doesnotexist", 0)
 	if err == nil {
 		t.Error("expected error for nonexistent project")
 	}
@@ -381,7 +391,7 @@ func TestStopAll(t *testing.T) {
 		}}
 		saveRoverRegistry(m.registryPath, reg)
 
-		if err := m.Start(name); err != nil {
+		if err := m.Start(name, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -416,7 +426,7 @@ func TestSubscribeUnsubscribe(t *testing.T) {
 	}}
 	saveRoverRegistry(m.registryPath, reg)
 
-	m.Start("streamapp")
+	m.Start("streamapp", 0)
 	defer m.Stop("streamapp")
 
 	ch, err := m.Subscribe("streamapp")
@@ -569,7 +579,7 @@ func TestSubscribeWithExistingOutput(t *testing.T) {
 	}}
 	saveRoverRegistry(m.registryPath, reg)
 
-	m.Start("preload")
+	m.Start("preload", 0)
 	defer m.Stop("preload")
 
 	time.Sleep(200 * time.Millisecond)
@@ -613,4 +623,74 @@ func TestValidateProjectTimeout(t *testing.T) {
 
 func isWindows() bool {
 	return os.PathSeparator == '\\'
+}
+
+func TestComposeStartCmd(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		port int
+		want string
+	}{
+		{"python server.py", 8765, "python server.py --port 8765"},
+		{"uv run python s.py --port {port}", 8080, "uv run python s.py --port 8080"},
+		{"app --port 9000", 8080, "app --port 9000"}, // explicit --port left alone
+		{"python s.py", 0, "python s.py"},            // no port -> unchanged
+	}
+	for _, c := range cases {
+		if got := composeStartCmd(c.cmd, c.port); got != c.want {
+			t.Errorf("composeStartCmd(%q,%d)=%q; want %q", c.cmd, c.port, got, c.want)
+		}
+	}
+}
+
+func TestStartPortInUse(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	appDir := filepath.Join(dir, "busy")
+	os.MkdirAll(appDir, 0755)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	startCmd := `sh -c 'echo {port}'`
+	if isWindows() {
+		startCmd = `cmd /C echo {port}`
+	}
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"busy": {Name: "busy", Path: appDir, StartCmd: startCmd, Port: port},
+	}}
+	saveRoverRegistry(m.registryPath, reg)
+
+	if err := m.Start("busy", 0); !errors.Is(err, ErrPortInUse) {
+		t.Fatalf("expected ErrPortInUse, got %v", err)
+	}
+}
+
+func TestUpdateProjectPort(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"app": {Name: "app", Path: dir, StartCmd: "python s.py", Port: 8000},
+	}}
+	saveRoverRegistry(m.registryPath, reg)
+
+	p, err := m.UpdateProjectPort("app", 8123)
+	if err != nil {
+		t.Fatalf("UpdateProjectPort: %v", err)
+	}
+	if p.Port != 8123 {
+		t.Errorf("returned port = %d; want 8123", p.Port)
+	}
+	if got := m.Scan(); len(got) != 1 || got[0].Port != 8123 {
+		t.Errorf("port not persisted: %+v", got)
+	}
+	if _, err := m.UpdateProjectPort("nope", 9000); err == nil {
+		t.Error("expected error updating unknown project")
+	}
 }

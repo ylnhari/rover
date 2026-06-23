@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -527,6 +528,7 @@ func New(cfg Config) *Server {
 		})
 		mux.HandleFunc("GET /api/projects", s.requireAuth(s.handleListProjects))
 		mux.HandleFunc("POST /api/projects", s.requireAuth(s.handleAddProject))
+		mux.HandleFunc("PUT /api/projects/{name}", s.requireAuth(s.handleUpdateProject))
 		mux.HandleFunc("DELETE /api/projects/{name}", s.requireAuth(s.handleRemoveProject))
 		mux.HandleFunc("POST /api/projects/{name}/start", s.requireAuth(s.handleStartProject))
 		mux.HandleFunc("POST /api/projects/{name}/stop", s.requireAuth(s.handleStopProject))
@@ -822,7 +824,26 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStartProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := s.launcher.Start(name); err != nil {
+
+	// Optional one-off port override for this start only (e.g. when the default
+	// port is occupied). An empty body means "use the registered default".
+	var body struct {
+		Port int `json:"port"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 256)).Decode(&body)
+	}
+
+	if err := s.launcher.Start(name, body.Port); err != nil {
+		if errors.Is(err, launcher.ErrPortInUse) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]any{
+				"error":       err.Error(),
+				"port_in_use": true,
+			})
+			return
+		}
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -889,6 +910,7 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name     string `json:"name"`
 		StartCmd string `json:"start_cmd"`
+		Port     int    `json:"port"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxAddProjectBody)).Decode(&body); err != nil {
 		jsonError(w, "invalid JSON", http.StatusBadRequest)
@@ -898,13 +920,39 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "name and start_cmd are required", http.StatusBadRequest)
 		return
 	}
+	if body.Port <= 0 {
+		jsonError(w, "a valid port is required", http.StatusBadRequest)
+		return
+	}
 
-	p, err := s.launcher.AddProject(body.Name, body.StartCmd)
+	p, err := s.launcher.AddProject(body.Name, body.StartCmd, body.Port)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p)
+}
+
+func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var body struct {
+		Port int `json:"port"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256)).Decode(&body); err != nil {
+		jsonError(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if body.Port <= 0 {
+		jsonError(w, "a valid port is required", http.StatusBadRequest)
+		return
+	}
+	p, err := s.launcher.UpdateProjectPort(name, body.Port)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(p)
 }
@@ -1151,8 +1199,8 @@ header h1{font-size:15px;font-weight:700;letter-spacing:-.3px}
 .btn-start:hover{background:var(--green-hover)}
 .btn-stop{background:var(--red);color:#fff}
 .btn-stop:hover{background:#dc2626}
-.btn-log{background:0 0;border:1px solid var(--border);color:var(--text-dim)}
-.btn-log:hover{border-color:var(--blue);color:var(--blue)}
+.btn-log,.btn-port{background:0 0;border:1px solid var(--border);color:var(--text-dim)}
+.btn-log:hover,.btn-port:hover{border-color:var(--blue);color:var(--blue)}
 .btn-start:disabled,.btn-stop:disabled{opacity:.5;cursor:default}
 .project-console{display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
 .project-console.open{display:block}
@@ -1248,6 +1296,10 @@ header h1{font-size:15px;font-weight:700;letter-spacing:-.3px}
 <div class="modal-field">
 <label>Start Command</label>
 <input type="text" id="addStartCmd" readonly>
+</div>
+<div class="modal-field">
+<label>Port (rover passes this to the app as --port)</label>
+<input type="number" id="addPort" min="1" max="65535" placeholder="e.g. 8770">
 </div>
 <div id="addProjectStatus"></div>
 </div>
@@ -1567,13 +1619,14 @@ const urlHtml=p.running_url?'<a href="'+p.running_url+'" target="_blank" class="
 		'<button class="btn-remove" data-project="'+esc(p.name)+'" title="Remove project">Remove</button>'+
 		'</div>'+
 '<div class="project-details">'+
-'<span>Port: '+(p.port||'auto')+'</span>'+
+'<span>Port: '+(p.port||'not set')+'</span>'+
 '<span id="url-'+esc(p.name)+'">'+urlHtml+'</span>'+
 '</div>'+
 '<div class="project-actions">'+
 '<button class="btn-start" id="start-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'||status==='starting'?'disabled':'')+'>Start</button>'+
 '<button class="btn-stop" id="stop-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'?'':'disabled')+'>Stop</button>'+
 '<button class="btn-log" id="log-'+esc(p.name)+'" data-project="'+esc(p.name)+'">Log</button>'+
+'<button class="btn-port" id="port-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-port="'+(p.port||'')+'">Edit Port</button>'+
 '</div>'+
 (p.description?'<div class="project-desc">'+esc(p.description)+'</div>':'')+
 '<div class="project-start-cmd">'+esc(p.start_cmd)+'</div>'+
@@ -1601,6 +1654,7 @@ const name=btn.dataset.project;
 if(btn.classList.contains('btn-start'))startProject(name);
 else if(btn.classList.contains('btn-stop'))stopProject(name);
 else if(btn.classList.contains('btn-log'))toggleLog(name);
+else if(btn.classList.contains('btn-port'))editPort(name,btn.dataset.port);
 else if(btn.classList.contains('btn-remove')){e.stopPropagation();removeProject(name);}
 });
 }
@@ -1610,7 +1664,7 @@ if(p.is_running)return'running';
 return'stopped';
 }
 
-window.startProject=async function(name){
+window.startProject=async function(name,portOverride){
 const dot=$('dot-'+name);
 const startBtn=$('start-'+name);
 const stopBtn=$('stop-'+name);
@@ -1619,12 +1673,20 @@ dot.className='status-dot starting';
 startBtn.disabled=true;
 stopBtn.disabled=true;
 try{
-const r=await fetch('/api/projects/'+encodeURIComponent(name)+'/start',{method:'POST',headers:{'X-Rover-Secret':getToken()}});
+const body=portOverride?JSON.stringify({port:portOverride}):'';
+const r=await fetch('/api/projects/'+encodeURIComponent(name)+'/start',{method:'POST',headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},body:body});
 if(!r.ok){
 const e=await r.json();
-alert('Failed to start: '+(e.error||r.status));
 dot.className='status-dot stopped';
 startBtn.disabled=false;
+if(r.status===409&&e.port_in_use){
+// Occupied port — offer a one-off alternative for THIS start only.
+const ans=prompt((e.error||'Port in use')+'.\nEnter a different port for this start (the default is unchanged):');
+const np=parseInt(ans,10);
+if(np>0)startProject(name,np);
+return;
+}
+alert('Failed to start: '+(e.error||r.status));
 return;
 }
 		dot.className='status-dot running';
@@ -1633,6 +1695,21 @@ return;
 	}catch(e){
 dot.className='status-dot stopped';
 startBtn.disabled=false;
+alert('Connection error: '+e.message);
+}
+};
+
+window.editPort=async function(name,current){
+const ans=prompt('Set the default port for "'+name+'" (rover passes it as --port on start):',current||'');
+if(ans===null)return;
+const np=parseInt(ans,10);
+if(!(np>0)){alert('Please enter a valid port number.');return;}
+try{
+const r=await fetch('/api/projects/'+encodeURIComponent(name),{method:'PUT',headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},body:JSON.stringify({port:np})});
+const data=await r.json();
+if(!r.ok){alert('Failed to update port: '+(data.error||r.status));return;}
+loadProjects();
+}catch(e){
 alert('Connection error: '+e.message);
 }
 };
@@ -1736,6 +1813,7 @@ function openAddProjectModal(){
 	$('addProjectConfirm').style.display='none';
 	$('addProjectStatus').className='';
 	$('addProjectStatus').textContent='';
+	$('addPort').value='';
 	selectedDir='';
 	selectedFile='';
 	loadProjectDirs();
@@ -1815,14 +1893,20 @@ async function validateAndAddProject(){
 	if(!selectedDir||!selectedFile)return;
 	const btn=$('addProjectConfirm');
 	const status=$('addProjectStatus');
+	const port=parseInt($('addPort').value,10);
+	if(!(port>0)){
+		status.className='error';
+		status.textContent='Please enter a valid port for this project.';
+		return;
+	}
 	btn.disabled=true;
 	status.className='loading';
-	status.textContent='Starting and validating project (max 15 seconds)...';
+	status.textContent='Starting and validating project on port '+port+' (max 15 seconds)...';
 	try{
 		const r=await fetch('/api/projects',{
 			method:'POST',
 			headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},
-			body:JSON.stringify({name:selectedDir,start_cmd:$('addStartCmd').value})
+			body:JSON.stringify({name:selectedDir,start_cmd:$('addStartCmd').value,port:port})
 		});
 		const data=await r.json();
 		if(!r.ok){

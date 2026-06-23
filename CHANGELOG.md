@@ -9,6 +9,19 @@ Rover uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Projects now use an explicit, registered port instead of self-discovery.** When
+  adding a project you supply the port; rover stores it and passes it to the app at
+  launch as `--port <port>` (or substitutes a `{port}` placeholder in the start command).
+- Starting a project **fails fast if its port is already in use** rather than launching
+  blindly; the web UI then prompts for a one-off alternate port for that start only,
+  leaving the registered default unchanged.
+
+### Added
+- `PUT /api/projects/{name}` and an **Edit Port** action to change a project's default
+  port at any time.
+- `port_in_use` (HTTP 409) response on start so clients can offer an override.
+
 ## [0.1.0] — 2026-06-23
 
 ### Added
