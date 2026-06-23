@@ -1,0 +1,35 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+
+# Temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rover personal data (never committed)
+projects_registry.json
+sessions.json
+
+# Claude Code settings
+.claude/
