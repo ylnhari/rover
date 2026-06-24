@@ -1162,6 +1162,11 @@ header h1{font-size:15px;font-weight:700;letter-spacing:-.3px}
 #runBtn.loading .spinner{display:inline-block}
 #runBtn.loading .label{display:none}
 @keyframes spin{to{transform:rotate(360deg)}}
+.cmd-hint{display:none;padding:6px 16px;font-size:12px;line-height:1.45;border-top:1px solid var(--border);background:var(--bg-alt)}
+.cmd-hint.show{display:block}
+.cmd-hint.lv-err{color:var(--red)}
+.cmd-hint.lv-warn{color:var(--amber)}
+.cmd-hint.lv-info{color:var(--text-dim)}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
 .modal-overlay.show{display:flex}
 .modal{background:var(--bg-alt);border:1px solid var(--border);border-radius:12px;padding:24px;width:90%;max-width:400px}
@@ -1273,6 +1278,7 @@ header h1{font-size:15px;font-weight:700;letter-spacing:-.3px}
 </div>
 <div id="terminalView">
 <div id="history"></div>
+<div id="cmdHint" class="cmd-hint"></div>
 <div class="input-bar">
 <input type="text" id="cmd" placeholder="Type a command..." autofocus spellcheck="false">
 <button id="runBtn"><span class="spinner"></span><span class="label">Run</span></button>
@@ -1491,6 +1497,57 @@ if(e.key==='ArrowUp'){e.preventDefault();if(cmdHistory.length&&histIdx>=-1){hist
 if(e.key==='ArrowDown'){e.preventDefault();if(cmdHistory.length&&histIdx>=0){histIdx=Math.min(cmdHistory.length-1,histIdx+1);cmdEl.value=cmdHistory[histIdx]||''}else{histIdx=-1;cmdEl.value=''}}
 });
 
+// Advisory pre-flight check: heuristics only — flags commands likely to misbehave
+// because rover runs each command in a fresh, non-interactive shell on the host.
+function commandHint(raw){
+var cmd=(raw||'').trim();
+if(!cmd)return null;
+var rest=cmd.replace(/^(sudo\s+)?((\w+=\S+)\s+)*/,'');
+var tokens=rest.split(/\s+/);
+var prog=(tokens[0]||'').toLowerCase().replace(/.*[\\/]/,'').replace(/\.(exe|cmd|bat)$/,'');
+var args=tokens.slice(1);
+var lc=rest.toLowerCase();
+var chained=/&&|;|\|/.test(rest);
+function has(a){return args.indexOf(a)!==-1}
+
+if((prog==='cd'||prog==='export'||prog==='set'||prog==='source'||prog==='.'||prog==='pushd'||/\bactivate\b/.test(lc)||lc.indexOf('nvm use')===0||lc.indexOf('conda activate')===0)&&!chained)
+return {level:'warn',msg:'rover runs every command in a fresh shell, so a directory or environment change here will NOT carry over to your next command. Chain them in one line with &&, e.g. cd dir && your-command.'};
+
+var gui=['start','explorer','open','xdg-open','gnome-open','kde-open','code','notepad','notepad++','gedit','chrome','google-chrome','chromium','firefox','msedge','edge','safari','brave'];
+if(gui.indexOf(prog)!==-1)
+return {level:'warn',msg:'This opens an app/window on the machine running rover, not in your browser here. In the foreground it blocks until that window closes (or the timeout); detached, it keeps running on the host with no output shown.'};
+
+var editors=['vim','vi','nano','emacs','pico','micro','vimtutor'];
+var pagers=['less','more','man','top','htop','btop'];
+var prompts=['ssh','telnet','ftp','sftp','su','passwd','gpg'];
+var repls=['python','python3','node','ruby','irb','php','psql','mysql','sqlite3','mongo','mongosh','redis-cli','bash','sh','zsh','fish','pwsh','powershell','julia','gdb'];
+if(editors.indexOf(prog)!==-1) return {level:'err',msg:prog+' is an interactive editor. rover has no terminal or stdin, so it will hang until the timeout. Not usable here.'};
+if(pagers.indexOf(prog)!==-1) return {level:'err',msg:prog+' needs an interactive terminal that rover does not provide, so it will hang until the timeout.'};
+if(prompts.indexOf(prog)!==-1) return {level:'err',msg:prog+' will prompt for input (e.g. a password or confirmation); rover cannot send input, so it will hang until the timeout. Use a non-interactive form (keys/flags).'};
+if(repls.indexOf(prog)!==-1&&args.length===0) return {level:'err',msg:prog+' with no script opens an interactive REPL; rover has no stdin, so it will hang until the timeout. Pass a script or use -c.'};
+if(prog==='tail'&&has('-f')) return {level:'warn',msg:'tail -f never ends and a Terminal command cannot be stopped, so it runs until the 10-min / 1 MB limit kills it.'};
+
+if(prog==='git'){
+if(args[0]==='commit'&&!(has('-m')||has('--message')||has('--amend')||has('-F')||has('--file'))) return {level:'warn',msg:'git commit without -m opens an editor, which will hang (no terminal). Use git commit -m "message".'};
+if(args[0]==='rebase'&&(has('-i')||has('--interactive'))) return {level:'err',msg:'git rebase -i is interactive and will hang; rover has no terminal.'};
+}
+if(prog==='npm'&&args[0]==='init'&&!(has('-y')||has('--yes'))) return {level:'warn',msg:'npm init prompts interactively; add -y, or it will hang until the timeout.'};
+
+if(prog==='vite'||prog==='nodemon'||/\b(dev|serve|watch|runserver)\b/.test(lc)||(prog==='npm'&&(has('dev')||has('start'))))
+return {level:'info',msg:'This looks long-running. The Terminal tab has no stop button, so it runs until it exits or hits the 10-min / 1 MB limit. To run a server, use the Projects tab instead.'};
+
+return null;
+}
+
+function renderCmdHint(){
+var el=$('cmdHint');if(!el)return;
+var h=commandHint(cmdEl.value);
+if(!h){el.className='cmd-hint';el.textContent='';return}
+el.className='cmd-hint show lv-'+h.level;
+el.textContent=(h.level==='info'?'ℹ ':'⚠ ')+h.msg;
+}
+cmdEl.addEventListener('input',renderCmdHint);
+
 async function run(){
 	const cmd=cmdEl.value.trim();
 	if(!cmd){cmdEl.focus();return}
@@ -1552,6 +1609,7 @@ alert('Connection error: '+e.message);
 runBtn.disabled=false;
 runBtn.classList.remove('loading');
 cmdEl.value='';
+renderCmdHint();
 cmdEl.focus();
 }
 }
