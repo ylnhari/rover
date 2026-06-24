@@ -427,6 +427,10 @@ type Config struct {
 	AllowCmds    []string // if non-empty, only commands with a matching prefix are permitted
 	SessionsFile string   // path to sessions persistence file; empty = no persistence
 	LogFormat    string   // "text" (default) or "json"
+	// DisableCommandGuard turns off the built-in block on interactive / GUI /
+	// stateful commands that can't work in rover's non-interactive shell.
+	// Default (false) = guard enabled.
+	DisableCommandGuard bool
 }
 
 type Server struct {
@@ -670,6 +674,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			s.logger.Warn("command blocked by allowlist", "src", r.RemoteAddr, "cmd", req.Command)
 			jsonError(w, "command not permitted by server allowlist", http.StatusForbidden)
+			return
+		}
+	}
+
+	if !s.cfg.DisableCommandGuard {
+		if blocked, reason := commandGuard(req.Command); blocked {
+			s.logger.Warn("command blocked by guard", "src", r.RemoteAddr, "cmd", req.Command)
+			jsonError(w, "blocked: "+reason, http.StatusUnprocessableEntity)
 			return
 		}
 	}
@@ -1544,7 +1556,9 @@ var el=$('cmdHint');if(!el)return;
 var h=commandHint(cmdEl.value);
 if(!h){el.className='cmd-hint';el.textContent='';return}
 el.className='cmd-hint show lv-'+h.level;
-el.textContent=(h.level==='info'?'ℹ ':'⚠ ')+h.msg;
+// err/warn categories are rejected server-side (HTTP 422); info is advisory only.
+var blocked=(h.level==='err'||h.level==='warn');
+el.textContent=(blocked?'🚫 Blocked: ':'ℹ ')+h.msg;
 }
 cmdEl.addEventListener('input',renderCmdHint);
 

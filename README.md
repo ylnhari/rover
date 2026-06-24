@@ -88,6 +88,7 @@ Flags:
   --max-output     int         max output bytes per command          (default: 1MB)
   --projects-dir   path        projects root directory
   --log-format     text|json   log output format                     (default: text)
+  --no-command-guard           allow interactive/GUI/stateful commands (default: blocked)
 ```
 
 ### Examples
@@ -115,11 +116,11 @@ rover serve --tls-cert /etc/ssl/rover.crt --tls-key /etc/ssl/rover.key
 
 Each command in the **Terminal** tab runs as a **separate, non-interactive process** on the machine where rover runs — wrapped as `cmd /C <command>` (Windows) or `sh -c <command>` (Unix). Worth knowing:
 
-- **No input / no TTY.** stdin is not connected and no terminal is allocated, so anything that prompts (passwords, confirmations) or needs a terminal — `vim`, `top`, `python`/`node` with no script, `ssh`, `git rebase -i`, `git commit` without `-m` — will **hang until the timeout**. You can't type into a running command.
+- **No input / no TTY.** stdin is not connected and no terminal is allocated, so anything that prompts (passwords, confirmations) or needs a terminal — `vim`, `top`, `python`/`node` with no script, `ssh`, `git rebase -i`, `git commit` without `-m` — would **hang until the timeout**. rover **blocks these by default** (see below); you can't type into a running command.
 - **Each command is a fresh shell.** Nothing persists between commands — `cd`, `export`, `source`/venv activation affect only that one run. Chain instead: `cd app && npm test`.
 - **It runs on the host, not your browser.** A command that opens a file/app/browser tab (`start`, `open`, `xdg-open`, `chrome`, `code`, `notepad`, …) does so on the **rover host's desktop** — you won't see it, and GUI apps produce no output. Foreground apps block until closed; detached ones keep running on the host.
 - **Terminal commands can't be stopped from the UI.** They run until they exit or hit `--exec-timeout` (default 10m) or `--max-output` (default 1MB). For long-running servers/watchers, use the **Projects** tab (it has start/stop) instead.
-- **Live advisory hint.** As you type, the UI flags commands that look interactive, GUI-opening, stateful, or long-running. It's best-effort guidance — it doesn't block you and can't perfectly predict every command.
+- **Interactive / GUI / stateful commands are blocked by default.** rover rejects commands that can't work in this model — interactive programs (editors, REPLs, password prompts), GUI/file/browser launchers, and non-persistent `cd`/`export`/venv-activation — with a clear reason (HTTP `422`), and the UI flags them as you type. It's a heuristic on the first token, so **long-running servers/watchers are *not* blocked** (use the Projects tab for those). Pass `--no-command-guard` to disable the guard and allow everything.
 
 None of this applies to ordinary non-interactive, log-producing work (builds, tests, scripts, git with flags).
 
@@ -256,7 +257,7 @@ A: Only with TLS + a strong secret + a firewall or VPN. Read [SECURITY.md](SECUR
 A: All child processes are killed during graceful shutdown.
 
 **Q: Can I run interactive commands (REPLs, editors, password prompts)?**  
-A: No. Terminal commands run with no stdin or TTY, so anything that waits for input hangs until the timeout. Use non-interactive forms (e.g. `git commit -m`, `npm init -y`). The UI warns you as you type.
+A: No — and rover **blocks them by default** with an HTTP `422` and a reason, since they'd just hang (no stdin/TTY). Use non-interactive forms (e.g. `git commit -m`, `npm init -y`). To override the guard entirely, start rover with `--no-command-guard`.
 
 **Q: Why didn't my `cd` (or `export` / venv activate) affect the next command?**  
 A: Every command runs in a fresh shell. Combine them in one command with `&&`, e.g. `cd app && npm test`.

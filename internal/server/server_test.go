@@ -712,6 +712,36 @@ func TestStartStopProjectViaAPI(t *testing.T) {
 	}
 }
 
+func TestCommandGuardViaAPI(t *testing.T) {
+	ts := httptest.NewServer(server.New(server.Config{Secret: testSecret}).Handler())
+	defer ts.Close()
+	token := loginToken(t, ts.URL, testSecret)
+
+	// interactive command is rejected with 422
+	resp := postJSON(t, ts.URL+"/api/sessions", `{"command":"vim notes.txt"}`, token)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("want 422 for vim, got %d", resp.StatusCode)
+	}
+
+	// a normal command still runs
+	resp2 := postJSON(t, ts.URL+"/api/sessions", `{"command":"echo hi"}`, token)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Errorf("want 202 for echo, got %d", resp2.StatusCode)
+	}
+
+	// with the guard disabled, the interactive command is allowed through
+	ts2 := httptest.NewServer(server.New(server.Config{Secret: testSecret, DisableCommandGuard: true}).Handler())
+	defer ts2.Close()
+	token2 := loginToken(t, ts2.URL, testSecret)
+	resp3 := postJSON(t, ts2.URL+"/api/sessions", `{"command":"vim notes.txt"}`, token2)
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusAccepted {
+		t.Errorf("want 202 with guard disabled, got %d", resp3.StatusCode)
+	}
+}
+
 func TestStartNonexistentProject(t *testing.T) {
 	dir := t.TempDir()
 	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())

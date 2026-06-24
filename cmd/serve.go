@@ -34,6 +34,7 @@ func runServe(args []string) error {
 	projectsDir := fs.String("projects-dir", "", "path to projects root (default: parent of rover directory)")
 	allow := fs.String("allow", "", "comma-separated command prefixes to allow (empty = allow all)")
 	logFormat := fs.String("log-format", "text", "log output format: text or json")
+	noGuard := fs.Bool("no-command-guard", false, "allow interactive/GUI/stateful commands that normally can't work over rover (default: blocked)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -89,10 +90,11 @@ func runServe(args []string) error {
 		KeyFile:      *keyFile,
 		ExecTimeout:  *execTimeout,
 		MaxOutput:    *maxOutput,
-		ProjectsRoot: projectsRoot,
-		AllowCmds:    allowCmds,
-		SessionsFile: defaultSessionsFile(),
-		LogFormat:    *logFormat,
+		ProjectsRoot:        projectsRoot,
+		AllowCmds:           allowCmds,
+		SessionsFile:        defaultSessionsFile(),
+		LogFormat:           *logFormat,
+		DisableCommandGuard: *noGuard,
 	}).ListenAndServe()
 }
 

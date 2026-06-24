@@ -18,6 +18,12 @@ Rover uses [Semantic Versioning](https://semver.org/).
   leaving the registered default unchanged.
 
 ### Added
+- **Command guard (on by default):** the Terminal tab now rejects commands that cannot
+  work in rover's fresh, non-interactive, host-side shell — interactive editors/REPLs/
+  pagers, password prompts, GUI/file/browser launchers, `git commit` without `-m`,
+  `git rebase -i`, `npm init` without `-y`, and non-persistent `cd`/`export`/venv
+  activation — with HTTP `422` and a reason. Long-running servers/watchers are not
+  blocked. Disable with `--no-command-guard`. The UI flags these live as you type.
 - `PUT /api/projects/{name}` and an **Edit Port** action to change a project's default
   port at any time.
 - `port_in_use` (HTTP 409) response on start so clients can offer an override.
