@@ -27,6 +27,13 @@ Rover uses [Semantic Versioning](https://semver.org/).
 - `PUT /api/projects/{name}` and an **Edit Port** action to change a project's default
   port at any time.
 - `port_in_use` (HTTP 409) response on start so clients can offer an override.
+- **Reverse proxy for projects (default ON).** Each project has a `proxy_enabled` toggle.
+  When enabled, Rover serves `GET /proxy/{name}/` which reverse-proxies to the project's
+  local port. This allows apps bound to `127.0.0.1` (the secure default) to be accessed
+  from Tailscale/LAN without per-project `--host 0.0.0.0` configuration. Toggle on/off
+  per project via `PUT /api/projects/{name}/proxy` or the Projects tab in the web UI.
+- `PUT /api/projects/{name}/proxy` endpoint to toggle per-project reverse proxy.
+- `proxy_enabled` field in `ProjectInfo` (serialized to `projects_registry.json`).
 
 ## [0.1.0] — 2026-06-23
 

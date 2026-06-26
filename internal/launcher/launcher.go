@@ -54,12 +54,13 @@ func portAvailable(port int) bool {
 }
 
 type ProjectInfo struct {
-	Name        string `json:"name"`
-	Path        string `json:"path"`
-	Port        int    `json:"port,omitempty"`
-	StartCmd    string `json:"start_cmd"`
-	URL         string `json:"url,omitempty"`
-	Description string `json:"description,omitempty"`
+	Name         string `json:"name"`
+	Path         string `json:"path"`
+	Port         int    `json:"port,omitempty"`
+	StartCmd     string `json:"start_cmd"`
+	URL          string `json:"url,omitempty"`
+	Description  string `json:"description,omitempty"`
+	ProxyEnabled bool   `json:"proxy_enabled"`
 }
 
 type StreamEvent struct {
@@ -639,12 +640,13 @@ func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, err
 	}
 
 	p := ProjectInfo{
-		Name:        name,
-		Path:        dir,
-		Port:        port,
-		StartCmd:    startCmd,
-		URL:         url,
-		Description: "Active",
+		Name:         name,
+		Path:         dir,
+		Port:         port,
+		StartCmd:     startCmd,
+		URL:          url,
+		Description:  "Active",
+		ProxyEnabled: true,
 	}
 	reg.Projects[name] = p
 
@@ -671,6 +673,32 @@ func (m *Manager) UpdateProjectPort(name string, port int) (*ProjectInfo, error)
 	}
 	p.Port = port
 	p.URL = fmt.Sprintf("http://127.0.0.1:%d", port)
+	reg.Projects[name] = p
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// GetProject returns the project info for a given name, or nil if not found.
+func (m *Manager) GetProject(name string) *ProjectInfo {
+	projects := m.Scan()
+	for _, p := range projects {
+		if p.Name == name {
+			return &p
+		}
+	}
+	return nil
+}
+
+// SetProxyEnabled updates the proxy_enabled flag for a project in the registry.
+func (m *Manager) SetProxyEnabled(name string, enabled bool) (*ProjectInfo, error) {
+	reg := loadRoverRegistry(m.registryPath)
+	p, ok := reg.Projects[name]
+	if !ok {
+		return nil, fmt.Errorf("project %q not found", name)
+	}
+	p.ProxyEnabled = enabled
 	reg.Projects[name] = p
 	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
 		return nil, err
@@ -706,6 +734,29 @@ func loadRoverRegistry(path string) roverRegistry {
 	if reg.Projects == nil {
 		reg.Projects = make(map[string]ProjectInfo)
 	}
+
+	// Migration: existing projects without proxy_enabled field in JSON
+	// default to false (Go zero value). Check raw JSON and set true where
+	// the field is absent.
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawMap); err == nil {
+		if rawProjects, ok := rawMap["projects"]; ok {
+			var projMap map[string]json.RawMessage
+			if err := json.Unmarshal(rawProjects, &projMap); err == nil {
+				for name, raw := range projMap {
+					var fields map[string]json.RawMessage
+					if err := json.Unmarshal(raw, &fields); err == nil {
+						if _, exists := fields["proxy_enabled"]; !exists {
+							p := reg.Projects[name]
+							p.ProxyEnabled = true
+							reg.Projects[name] = p
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return reg
 }
 

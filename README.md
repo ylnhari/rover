@@ -32,6 +32,7 @@ Open [http://localhost:2278](http://localhost:2278) and log in with your secret.
 - **Start/stop projects** from the browser — Python scripts, Node servers, Go programs, etc.
 - **Auto URL detection** — Rover extracts the URL/port from stdout when a project starts
 - **Live console streaming** — view project logs in real time via SSE
+- **Reverse proxy (default ON)** — Rover can proxy requests to apps bound to `127.0.0.1`, making them accessible via Tailscale/LAN without changing app configuration. Toggle per-project in the dashboard.
 - **Persistent registry** — projects are saved to `projects_registry.json` (git-ignored)
 - **Clean shutdown** — all launched projects are killed when Rover exits
 
@@ -150,6 +151,8 @@ All protected endpoints require the `X-Rover-Secret: <token>` header, where `<to
 | POST | `/api/projects/{name}/start` | ✓ | Start a project |
 | POST | `/api/projects/{name}/stop` | ✓ | Stop a running project |
 | GET | `/api/projects/{name}/stream` | ✓ | SSE live console output |
+| PUT | `/api/projects/{name}/proxy` | ✓ | Toggle reverse proxy on/off for a project |
+| GET | `/proxy/{name}/` | — | Reverse-proxy requests to the project's port (only when running) |
 
 ---
 
@@ -235,6 +238,8 @@ git push origin v0.1.0
 
 The registry file is personal and git-ignored — each installation has its own.
 
+Each project in the registry includes a `proxy_enabled` field (default `true`). When enabled, Rover exposes a reverse-proxy URL at `http://<rover-addr>/proxy/<project-name>/` that forwards to the app's port, allowing apps bound to `127.0.0.1` to be accessed from other devices on the network/VPN without any app-level configuration.
+
 **Supported extensions:** `.py` `.sh` `.bat` `.ps1` `.js` `.ts` `.go` `.rb` `.php` `.pl` `.lua`
 
 ---
@@ -254,7 +259,7 @@ A: Use `--allow "git,go test,npm"`. Rover will reject any command that doesn't s
 A: Only with TLS + a strong secret + a firewall or VPN. Read [SECURITY.md](SECURITY.md) first.
 
 **Q: What happens to running projects when Rover shuts down?**  
-A: All child processes are killed during graceful shutdown.
+A: On **graceful shutdown** (Ctrl+C), Rover kills all child processes via `taskkill /F /T` (Windows) or `kill -9` (Unix). On **forced kill** (`SIGKILL`, `Stop-Process -Force`, taskkill without `/T`), child processes become orphans — always use graceful shutdown when possible.
 
 **Q: Can I run interactive commands (REPLs, editors, password prompts)?**  
 A: No — and rover **blocks them by default** with an HTTP `422` and a reason, since they'd just hang (no stdin/TTY). Use non-interactive forms (e.g. `git commit -m`, `npm init -y`). To override the guard entirely, start rover with `--no-command-guard`.

@@ -14,6 +14,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -30,11 +32,11 @@ import (
 )
 
 const (
-	maxCommandBytes  = 10 * 1024
+	maxCommandBytes   = 10 * 1024
 	maxAddProjectBody = 4 * 1024
-	scanBufSize      = 256 * 1024
-	maxSessions      = 500
-	loginMaxPerMin   = 10
+	scanBufSize       = 256 * 1024
+	maxSessions       = 500
+	loginMaxPerMin    = 10
 )
 
 type rateLimiter struct {
@@ -539,6 +541,8 @@ func New(cfg Config) *Server {
 		mux.HandleFunc("GET /api/projects/{name}/stream", s.requireAuth(s.handleProjectStream))
 		mux.HandleFunc("GET /api/projects/dirs", s.requireAuth(s.handleListProjectDirs))
 		mux.HandleFunc("GET /api/projects/{name}/files", s.requireAuth(s.handleListProjectFiles))
+		mux.HandleFunc("PUT /api/projects/{name}/proxy", s.requireAuth(s.handleToggleProxy))
+		mux.HandleFunc("GET /proxy/{name}/", s.handleProxy)
 	}
 
 	s.mux = mux
@@ -804,12 +808,14 @@ func (s *Server) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	projects := s.launcher.Scan()
 	running := s.launcher.ListRunning()
+	localAddr := s.localRoverAddr()
 
 	type projectView struct {
 		launcher.ProjectInfo
 		IsRunning bool   `json:"is_running"`
 		URL       string `json:"running_url,omitempty"`
 		StartedAt string `json:"started_at,omitempty"`
+		ProxyURL  string `json:"proxy_url,omitempty"`
 	}
 
 	runMap := make(map[string]launcher.RunningProject)
@@ -826,6 +832,9 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 			v.Port = rp.Port
 			v.ProjectInfo.URL = rp.URL
 			v.StartedAt = rp.StartTime.Format(time.RFC3339)
+		}
+		if p.ProxyEnabled {
+			v.ProxyURL = fmt.Sprintf("http://%s/proxy/%s/", localAddr, p.Name)
 		}
 		views = append(views, v)
 	}
@@ -998,6 +1007,69 @@ func (s *Server) handleListProjectFiles(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(files)
 }
 
+func (s *Server) handleToggleProxy(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256)).Decode(&body); err != nil {
+		jsonError(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	p, err := s.launcher.SetProxyEnabled(name, body.Enabled)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p)
+}
+
+func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	proj := s.launcher.GetProject(name)
+	if proj == nil {
+		jsonError(w, "project not found", http.StatusNotFound)
+		return
+	}
+	if !proj.ProxyEnabled {
+		jsonError(w, "proxy not enabled for this project", http.StatusForbidden)
+		return
+	}
+
+	running := s.launcher.GetRunning(name)
+	if running == nil {
+		jsonError(w, "project not running", http.StatusBadGateway)
+		return
+	}
+
+	target, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", running.Port))
+	if err != nil {
+		jsonError(w, "invalid target", http.StatusInternalServerError)
+		return
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		prefix := "/proxy/" + name
+		if strings.HasPrefix(req.URL.Path, prefix) {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
+			if req.URL.Path == "" {
+				req.URL.Path = "/"
+			}
+		}
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		s.logger.Error("proxy error", "project", name, "error", err)
+		jsonError(w, "proxy error: "+err.Error(), http.StatusBadGateway)
+	}
+
+	proxy.ServeHTTP(w, r)
+}
+
 func newID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -1064,6 +1136,27 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		"exec_timeout_seconds": s.sessions.GetExecTimeout().Seconds(),
 		"max_output_bytes":     s.sessions.GetMaxOutput(),
 	})
+}
+
+func (s *Server) localRoverAddr() string {
+	addr := s.cfg.Addr
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "localhost"
+	}
+	if host != "" && host != "0.0.0.0" {
+		return net.JoinHostPort(host, port)
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return net.JoinHostPort("localhost", port)
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			return net.JoinHostPort(ipnet.IP.String(), port)
+		}
+	}
+	return net.JoinHostPort("localhost", port)
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -1219,6 +1312,10 @@ header h1{font-size:15px;font-weight:700;letter-spacing:-.3px}
 .btn-log,.btn-port{background:0 0;border:1px solid var(--border);color:var(--text-dim)}
 .btn-log:hover,.btn-port:hover{border-color:var(--blue);color:var(--blue)}
 .btn-start:disabled,.btn-stop:disabled{opacity:.5;cursor:default}
+.btn-proxy-on{background:var(--green);color:#fff;padding:5px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-proxy-on:hover{background:var(--green-hover)}
+.btn-proxy-off{background:0 0;border:1px solid var(--border);color:var(--text-dim);padding:5px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);transition:all .15s}
+.btn-proxy-off:hover{border-color:var(--blue);color:var(--blue)}
 .project-console{display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
 .project-console.open{display:block}
 .project-console-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
@@ -1683,22 +1780,27 @@ for(const p of projects){
 const status=determineStatus(p);
 const dotCls=status==='running'?'running':status==='starting'?'starting':status==='failed'?'failed':'stopped';
 const btnDisabled=status==='starting'?'disabled':'';
-const urlHtml=p.running_url?'<a href="'+p.running_url+'" target="_blank" class="project-url">'+esc(p.running_url)+'</a>':'';
-	html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
-		'<div class="project-card-header">'+
-		'<span class="status-dot '+dotCls+'" id="dot-'+esc(p.name)+'"></span>'+
-		'<span class="project-name">'+esc(p.name)+'</span>'+
-		'<button class="btn-remove" data-project="'+esc(p.name)+'" title="Remove project">Remove</button>'+
-		'</div>'+
+	const urlHtml=p.running_url?'<a href="'+p.running_url+'" target="_blank" class="project-url">'+esc(p.running_url)+'</a>':'';
+	const proxyUrlHtml=p.proxy_url?'<a href="'+p.proxy_url+'" target="_blank" class="project-url" style="color:var(--green)">\u2390 '+esc(p.proxy_url)+'</a>':'';
+	const proxyLabel=p.proxy_enabled?'Proxy ON':'Proxy OFF';
+	const proxyBtnCls=p.proxy_enabled?'btn-proxy-on':'btn-proxy-off';
+ 	html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
+ 		'<div class="project-card-header">'+
+ 		'<span class="status-dot '+dotCls+'" id="dot-'+esc(p.name)+'"></span>'+
+ 		'<span class="project-name">'+esc(p.name)+'</span>'+
+ 		'<button class="btn-remove" data-project="'+esc(p.name)+'" title="Remove project">Remove</button>'+
+ 		'</div>'+
 '<div class="project-details">'+
 '<span>Port: '+(p.port||'not set')+'</span>'+
 '<span id="url-'+esc(p.name)+'">'+urlHtml+'</span>'+
+(proxyUrlHtml?'<span id="proxyurl-'+esc(p.name)+'">'+proxyUrlHtml+'</span>':'')+
 '</div>'+
 '<div class="project-actions">'+
 '<button class="btn-start" id="start-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'||status==='starting'?'disabled':'')+'>Start</button>'+
 '<button class="btn-stop" id="stop-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'?'':'disabled')+'>Stop</button>'+
 '<button class="btn-log" id="log-'+esc(p.name)+'" data-project="'+esc(p.name)+'">Log</button>'+
 '<button class="btn-port" id="port-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-port="'+(p.port||'')+'">Edit Port</button>'+
+'<button class="'+proxyBtnCls+'" id="proxy-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-enabled="'+p.proxy_enabled+'">'+proxyLabel+'</button>'+
 '</div>'+
 (p.description?'<div class="project-desc">'+esc(p.description)+'</div>':'')+
 '<div class="project-start-cmd">'+esc(p.start_cmd)+'</div>'+
@@ -1728,6 +1830,7 @@ else if(btn.classList.contains('btn-stop'))stopProject(name);
 else if(btn.classList.contains('btn-log'))toggleLog(name);
 else if(btn.classList.contains('btn-port'))editPort(name,btn.dataset.port);
 else if(btn.classList.contains('btn-remove')){e.stopPropagation();removeProject(name);}
+else if(btn.classList.contains('btn-proxy-on')||btn.classList.contains('btn-proxy-off'))toggleProxy(name);
 });
 }
 
@@ -2013,6 +2116,22 @@ window.removeProject=async function(name){
 	}catch(e){
 		alert('Connection error: '+e.message);
 	}
+};
+
+window.toggleProxy=async function(name){
+const btn=$('proxy-'+name);
+if(!btn)return;
+const wasEnabled=btn.dataset.enabled==='true';
+const newEnabled=!wasEnabled;
+try{
+const r=await fetch('/api/projects/'+encodeURIComponent(name)+'/proxy',{
+method:'PUT',
+headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},
+body:JSON.stringify({enabled:newEnabled})
+});
+if(!r.ok){const e=await r.json();alert('Failed to toggle proxy: '+(e.error||r.status));return;}
+loadProjects();
+}catch(e){alert('Connection error: '+e.message);}
 };
 
 checkAuth();
