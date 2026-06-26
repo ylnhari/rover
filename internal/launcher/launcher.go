@@ -225,7 +225,11 @@ func (m *Manager) Start(name string, portOverride int) error {
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
-	cmd.Env = append(cmd.Env, "PYTHONUNBUFFERED=1")
+	cmd.Env = append(cmd.Env,
+		"PYTHONUNBUFFERED=1",
+		"PYTHONIOENCODING=utf-8",
+		"PYTHONLEGACYWINDOWSSTDIO=utf-8",
+	)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -554,7 +558,11 @@ func (m *Manager) ValidateProject(dir, startCmd string) (int, string, error) {
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
-	cmd.Env = append(cmd.Env, "PYTHONUNBUFFERED=1")
+	cmd.Env = append(cmd.Env,
+		"PYTHONUNBUFFERED=1",
+		"PYTHONIOENCODING=utf-8",
+		"PYTHONLEGACYWINDOWSSTDIO=utf-8",
+	)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
