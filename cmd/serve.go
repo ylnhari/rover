@@ -45,7 +45,16 @@ func runServe(args []string) error {
 		sec = os.Getenv("ROVER_SECRET")
 	}
 	if sec == "" {
-		fmt.Println("WARNING: Running in secret-less mode. No authentication required.")
+		// Secret-less mode grants unauthenticated command execution, so it is
+		// only permitted when rover is bound to loopback. Binding to any other
+		// interface (including the all-interfaces default ":port") without a
+		// secret would expose the host to the network and is refused.
+		host, _, _ := net.SplitHostPort(*addr)
+		if isLoopbackBind(host) {
+			fmt.Println("WARNING: Running without a secret. Authentication is disabled, but rover is bound to loopback only.")
+		} else {
+			return fmt.Errorf("refusing to start without a secret while bound to %q: set --secret or $ROVER_SECRET, or bind to 127.0.0.1 for local-only use", *addr)
+		}
 	}
 
 	var allowCmds []string
@@ -96,6 +105,21 @@ func runServe(args []string) error {
 		LogFormat:           *logFormat,
 		DisableCommandGuard: *noGuard,
 	}).ListenAndServe()
+}
+
+// isLoopbackBind reports whether host refers only to the local machine. An
+// empty host (from an all-interfaces bind like ":2278") is NOT loopback.
+func isLoopbackBind(host string) bool {
+	switch host {
+	case "localhost":
+		return true
+	case "":
+		return false
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func ensurePortFree(addr string) error {

@@ -694,3 +694,22 @@ func TestUpdateProjectPort(t *testing.T) {
 		t.Error("expected error updating unknown project")
 	}
 }
+
+func TestProxyURLHost(t *testing.T) {
+	// A specific routable bind host is advertised verbatim (what a remote
+	// client should hit). Loopback / all-interfaces binds fall back to a
+	// routable IP, which is environment-dependent, so only assert they are
+	// never the unusable 0.0.0.0 / empty / loopback literal.
+	if got := proxyURLHost("100.90.58.116"); got != "100.90.58.116" {
+		t.Errorf("proxyURLHost(tailnet) = %q; want verbatim", got)
+	}
+	if got := proxyURLHost("192.168.1.10"); got != "192.168.1.10" {
+		t.Errorf("proxyURLHost(lan) = %q; want verbatim", got)
+	}
+	for _, in := range []string{"", "0.0.0.0", "::", "127.0.0.1"} {
+		got := proxyURLHost(in)
+		if got == "" || got == "0.0.0.0" || got == "127.0.0.1" || got == "::" {
+			t.Errorf("proxyURLHost(%q) = %q; want a routable fallback", in, got)
+		}
+	}
+}

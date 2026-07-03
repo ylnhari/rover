@@ -9,6 +9,15 @@ Rover uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **Secret is now required unless bound to loopback.** Rover previously ran in an
+  unauthenticated "secret-less mode" while still binding all interfaces; it now refuses
+  to start without `--secret`/`$ROVER_SECRET` unless `--addr` is a loopback host. This
+  closes silent unauthenticated remote command execution on shared networks.
+- **Project reverse proxies now bind to Rover's own interface** instead of `0.0.0.0`.
+  A proxied app can no longer be reached from a network Rover itself is not exposed to;
+  bind Rover to your Tailscale IP and the proxies are private to your tailnet.
+
 ### Changed
 - **Projects now use an explicit, registered port instead of self-discovery.** When
   adding a project you supply the port; rover stores it and passes it to the app at
@@ -28,10 +37,11 @@ Rover uses [Semantic Versioning](https://semver.org/).
   port at any time.
 - `port_in_use` (HTTP 409) response on start so clients can offer an override.
 - **Reverse proxy for projects (default ON).** Each project has a `proxy_enabled` toggle.
-  When enabled, Rover serves `GET /proxy/{name}/` which reverse-proxies to the project's
-  local port. This allows apps bound to `127.0.0.1` (the secure default) to be accessed
-  from Tailscale/LAN without per-project `--host 0.0.0.0` configuration. Toggle on/off
-  per project via `PUT /api/projects/{name}/proxy` or the Projects tab in the web UI.
+  When enabled, Rover allocates a dedicated port as a reverse-proxy to the project's
+  local port, avoiding path-prefix conflicts. This allows apps bound to `127.0.0.1`
+  (the secure default) to be accessed from Tailscale/LAN without per-project
+  `--host 0.0.0.0` configuration. Toggle on/off per project via
+  `PUT /api/projects/{name}/proxy` or the Projects tab in the web UI.
 - `PUT /api/projects/{name}/proxy` endpoint to toggle per-project reverse proxy.
 - `proxy_enabled` field in `ProjectInfo` (serialized to `projects_registry.json`).
 

@@ -39,6 +39,7 @@ Open [http://localhost:2278](http://localhost:2278) and log in with your secret.
 ### Security
 - **HMAC-SHA256 session tokens** — login returns a signed, time-limited token (24h TTL); the raw secret is never stored in the browser
 - **`X-Rover-Secret` header auth** — all protected endpoints require the token header
+- **Secret required off-loopback** — Rover refuses to start without a secret unless bound to `127.0.0.1`; secret-less mode can never expose the host to the network
 - **Rate-limited login** — 10 attempts per IP per minute
 - **Command allowlist** — `--allow git,go test,npm` blocks everything else
 - **Security headers** — `X-Frame-Options`, `X-Content-Type-Options`, `Content-Security-Policy`
@@ -152,7 +153,7 @@ All protected endpoints require the `X-Rover-Secret: <token>` header, where `<to
 | POST | `/api/projects/{name}/stop` | ✓ | Stop a running project |
 | GET | `/api/projects/{name}/stream` | ✓ | SSE live console output |
 | PUT | `/api/projects/{name}/proxy` | ✓ | Toggle reverse proxy on/off for a project |
-| GET | `/proxy/{name}/` | — | Reverse-proxy requests to the project's port (only when running) |
+| | `http://<rover-addr>:<proxy-port>/` | — | Per-project reverse-proxy listener on a dedicated port (auto-assigned on start) |
 
 ---
 
@@ -238,7 +239,7 @@ git push origin v0.1.0
 
 The registry file is personal and git-ignored — each installation has its own.
 
-Each project in the registry includes a `proxy_enabled` field (default `true`). When enabled, Rover exposes a reverse-proxy URL at `http://<rover-addr>/proxy/<project-name>/` that forwards to the app's port, allowing apps bound to `127.0.0.1` to be accessed from other devices on the network/VPN without any app-level configuration.
+Each project in the registry includes a `proxy_enabled` field (default `true`). When enabled, Rover allocates a dedicated listener that reverse-proxies to the project's local port. **The proxy binds to the same interface Rover itself listens on** (the host portion of `--addr`), so a proxied app is never reachable from a network Rover is not — bind Rover to your Tailscale IP and the proxies follow. The proxy URL (`http://<rover-ip>:<proxy-port>/`) is shown in the dashboard next to the running project. This allows apps bound to `127.0.0.1` to be accessed from your own devices over Tailscale/VPN without any app-level configuration.
 
 **Supported extensions:** `.py` `.sh` `.bat` `.ps1` `.js` `.ts` `.go` `.rb` `.php` `.pl` `.lua`
 

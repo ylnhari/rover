@@ -14,8 +14,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -532,6 +530,11 @@ func New(cfg Config) *Server {
 		s.launcher.SetLogger(func(msg string, args ...any) {
 			s.logger.Info(fmt.Sprintf(msg, args...))
 		})
+		// Project proxies inherit rover's own bind interface so they are never
+		// reachable from a network rover itself is not exposed to.
+		if host, _, err := net.SplitHostPort(cfg.Addr); err == nil {
+			s.launcher.SetBindHost(host)
+		}
 		mux.HandleFunc("GET /api/projects", s.requireAuth(s.handleListProjects))
 		mux.HandleFunc("POST /api/projects", s.requireAuth(s.handleAddProject))
 		mux.HandleFunc("PUT /api/projects/{name}", s.requireAuth(s.handleUpdateProject))
@@ -542,7 +545,6 @@ func New(cfg Config) *Server {
 		mux.HandleFunc("GET /api/projects/dirs", s.requireAuth(s.handleListProjectDirs))
 		mux.HandleFunc("GET /api/projects/{name}/files", s.requireAuth(s.handleListProjectFiles))
 		mux.HandleFunc("PUT /api/projects/{name}/proxy", s.requireAuth(s.handleToggleProxy))
-		mux.HandleFunc("GET /proxy/{name}/", s.handleProxy)
 	}
 
 	s.mux = mux
@@ -808,7 +810,6 @@ func (s *Server) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	projects := s.launcher.Scan()
 	running := s.launcher.ListRunning()
-	localAddr := s.localRoverAddr()
 
 	type projectView struct {
 		launcher.ProjectInfo
@@ -832,9 +833,9 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 			v.Port = rp.Port
 			v.ProjectInfo.URL = rp.URL
 			v.StartedAt = rp.StartTime.Format(time.RFC3339)
-		}
-		if p.ProxyEnabled {
-			v.ProxyURL = fmt.Sprintf("http://%s/proxy/%s/", localAddr, p.Name)
+			if p.ProxyEnabled && rp.ProxyURL != "" {
+				v.ProxyURL = rp.ProxyURL
+			}
 		}
 		views = append(views, v)
 	}
@@ -959,23 +960,46 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	var body struct {
-		Port int `json:"port"`
+		Port     int    `json:"port"`
+		StartCmd string `json:"start_cmd"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 256)).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 512)).Decode(&body); err != nil {
 		jsonError(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if body.Port <= 0 {
-		jsonError(w, "a valid port is required", http.StatusBadRequest)
-		return
+
+	switch {
+	case body.Port > 0 && body.StartCmd != "":
+		if _, err := s.launcher.UpdateProjectPort(name, body.Port); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		p, err := s.launcher.UpdateProjectCommand(name, body.StartCmd)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(p)
+	case body.Port > 0:
+		p, err := s.launcher.UpdateProjectPort(name, body.Port)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(p)
+	case body.StartCmd != "":
+		p, err := s.launcher.UpdateProjectCommand(name, body.StartCmd)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(p)
+	default:
+		jsonError(w, "provide port (>0) and/or start_cmd to update", http.StatusBadRequest)
 	}
-	p, err := s.launcher.UpdateProjectPort(name, body.Port)
-	if err != nil {
-		jsonError(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(p)
 }
 
 func (s *Server) handleRemoveProject(w http.ResponseWriter, r *http.Request) {
@@ -1023,51 +1047,6 @@ func (s *Server) handleToggleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(p)
-}
-
-func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-
-	proj := s.launcher.GetProject(name)
-	if proj == nil {
-		jsonError(w, "project not found", http.StatusNotFound)
-		return
-	}
-	if !proj.ProxyEnabled {
-		jsonError(w, "proxy not enabled for this project", http.StatusForbidden)
-		return
-	}
-
-	running := s.launcher.GetRunning(name)
-	if running == nil {
-		jsonError(w, "project not running", http.StatusBadGateway)
-		return
-	}
-
-	target, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", running.Port))
-	if err != nil {
-		jsonError(w, "invalid target", http.StatusInternalServerError)
-		return
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		prefix := "/proxy/" + name
-		if strings.HasPrefix(req.URL.Path, prefix) {
-			req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
-			if req.URL.Path == "" {
-				req.URL.Path = "/"
-			}
-		}
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		s.logger.Error("proxy error", "project", name, "error", err)
-		jsonError(w, "proxy error: "+err.Error(), http.StatusBadGateway)
-	}
-
-	proxy.ServeHTTP(w, r)
 }
 
 func newID() string {
@@ -1136,27 +1115,6 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		"exec_timeout_seconds": s.sessions.GetExecTimeout().Seconds(),
 		"max_output_bytes":     s.sessions.GetMaxOutput(),
 	})
-}
-
-func (s *Server) localRoverAddr() string {
-	addr := s.cfg.Addr
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "localhost"
-	}
-	if host != "" && host != "0.0.0.0" {
-		return net.JoinHostPort(host, port)
-	}
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return net.JoinHostPort("localhost", port)
-	}
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-			return net.JoinHostPort(ipnet.IP.String(), port)
-		}
-	}
-	return net.JoinHostPort("localhost", port)
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -1309,7 +1267,7 @@ header h1{font-size:15px;font-weight:700;letter-spacing:-.3px}
 .btn-start:hover{background:var(--green-hover)}
 .btn-stop{background:var(--red);color:#fff}
 .btn-stop:hover{background:#dc2626}
-.btn-log,.btn-port{background:0 0;border:1px solid var(--border);color:var(--text-dim)}
+.btn-log,.btn-port,.btn-cmd{background:0 0;border:1px solid var(--border);color:var(--text-dim)}
 .btn-log:hover,.btn-port:hover{border-color:var(--blue);color:var(--blue)}
 .btn-start:disabled,.btn-stop:disabled{opacity:.5;cursor:default}
 .btn-proxy-on{background:var(--green);color:#fff;padding:5px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
@@ -1409,8 +1367,8 @@ header h1{font-size:15px;font-weight:700;letter-spacing:-.3px}
 </div>
 <div id="addProjectDetails" style="display:none">
 <div class="modal-field">
-<label>Start Command</label>
-<input type="text" id="addStartCmd" readonly>
+<label>Start Command (edit to add extra CLI flags)</label>
+<input type="text" id="addStartCmd" placeholder="e.g. python server.py --host 0.0.0.0">
 </div>
 <div class="modal-field">
 <label>Port (rover passes this to the app as --port)</label>
@@ -1800,6 +1758,7 @@ const btnDisabled=status==='starting'?'disabled':'';
 '<button class="btn-stop" id="stop-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'?'':'disabled')+'>Stop</button>'+
 '<button class="btn-log" id="log-'+esc(p.name)+'" data-project="'+esc(p.name)+'">Log</button>'+
 '<button class="btn-port" id="port-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-port="'+(p.port||'')+'">Edit Port</button>'+
+'<button class="btn-cmd" id="cmd-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-cmd="'+esc(p.start_cmd)+'">Edit Cmd</button>'+
 '<button class="'+proxyBtnCls+'" id="proxy-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-enabled="'+p.proxy_enabled+'">'+proxyLabel+'</button>'+
 '</div>'+
 (p.description?'<div class="project-desc">'+esc(p.description)+'</div>':'')+
@@ -1831,6 +1790,7 @@ else if(btn.classList.contains('btn-log'))toggleLog(name);
 else if(btn.classList.contains('btn-port'))editPort(name,btn.dataset.port);
 else if(btn.classList.contains('btn-remove')){e.stopPropagation();removeProject(name);}
 else if(btn.classList.contains('btn-proxy-on')||btn.classList.contains('btn-proxy-off'))toggleProxy(name);
+else if(btn.classList.contains('btn-cmd'))editCommand(name);
 });
 }
 
@@ -1883,6 +1843,23 @@ try{
 const r=await fetch('/api/projects/'+encodeURIComponent(name),{method:'PUT',headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},body:JSON.stringify({port:np})});
 const data=await r.json();
 if(!r.ok){alert('Failed to update port: '+(data.error||r.status));return;}
+loadProjects();
+}catch(e){
+alert('Connection error: '+e.message);
+}
+};
+
+window.editCommand=async function(name){
+const btn=$('cmd-'+name);
+if(!btn)return;
+const current=btn.dataset.cmd||'';
+const ans=prompt('Edit start command for "'+name+'":',current);
+if(ans===null)return;
+if(!ans.trim()){alert('Start command cannot be empty.');return;}
+try{
+const r=await fetch('/api/projects/'+encodeURIComponent(name),{method:'PUT',headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},body:JSON.stringify({start_cmd:ans.trim()})});
+const data=await r.json();
+if(!r.ok){alert('Failed to update command: '+(data.error||r.status));return;}
 loadProjects();
 }catch(e){
 alert('Connection error: '+e.message);

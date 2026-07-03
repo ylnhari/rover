@@ -10,6 +10,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,17 +76,21 @@ type RunningProject struct {
 	StartTime time.Time `json:"start_time"`
 	Port      int       `json:"port,omitempty"`
 	URL       string    `json:"url,omitempty"`
+	ProxyPort int       `json:"proxy_port,omitempty"`
+	ProxyURL  string    `json:"proxy_url,omitempty"`
 }
 
 type runningProcess struct {
-	info     RunningProject
-	cmd      *exec.Cmd
-	output   bytes.Buffer
-	outputMu sync.Mutex
-	subs     []chan StreamEvent
-	subsMu   sync.Mutex
-	done     chan struct{}
-	cancel   context.CancelFunc
+	info        RunningProject
+	cmd         *exec.Cmd
+	output      bytes.Buffer
+	outputMu    sync.Mutex
+	subs        []chan StreamEvent
+	subsMu      sync.Mutex
+	done        chan struct{}
+	cancel      context.CancelFunc
+	proxyServer *http.Server
+	proxyLn     net.Listener
 }
 
 type Manager struct {
@@ -92,6 +99,10 @@ type Manager struct {
 	procs        map[string]*runningProcess
 	mu           sync.Mutex
 	logf         func(string, ...any)
+	// bindHost is the interface rover itself listens on. Project proxies bind
+	// to the same host so a proxy is never reachable from a network rover is
+	// not. Empty means all interfaces (0.0.0.0).
+	bindHost string
 }
 
 type FileInfo struct {
@@ -120,6 +131,21 @@ func localIP() string {
 	return "localhost"
 }
 
+// proxyURLHost picks the host to advertise in a project's proxy URL. When rover
+// is bound to a specific routable interface (e.g. a Tailscale IP), that address
+// is exactly what a remote client should hit, so use it verbatim. For an
+// all-interfaces or loopback bind, fall back to a routable LAN/tailnet IP.
+func proxyURLHost(bindHost string) string {
+	switch bindHost {
+	case "", "0.0.0.0", "::", "[::]":
+		return localIP()
+	}
+	if ip := net.ParseIP(strings.Trim(bindHost, "[]")); ip != nil && ip.IsLoopback() {
+		return localIP()
+	}
+	return bindHost
+}
+
 func replaceLoopback(url string) string {
 	ip := localIP()
 	if ip == "localhost" {
@@ -146,6 +172,35 @@ func NewManager(projectsRoot string) *Manager {
 
 func (m *Manager) SetLogger(logf func(string, ...any)) {
 	m.logf = logf
+}
+
+// SetBindHost records the interface rover listens on so project proxies inherit
+// the same exposure. Pass the host portion of rover's --addr ("" = all interfaces).
+func (m *Manager) SetBindHost(host string) {
+	m.bindHost = host
+}
+
+func startProxy(bindHost string, targetPort int) (net.Listener, *http.Server, int, error) {
+	// Bind the proxy to the same interface rover listens on so it is never
+	// reachable from a network rover itself is not exposed to. An empty
+	// bindHost preserves the historical all-interfaces behaviour.
+	ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, "0"))
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	pport := ln.Addr().(*net.TCPAddr).Port
+
+	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", targetPort))
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	srv := &http.Server{Handler: proxy}
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("proxy listener error: %v", err)
+		}
+	}()
+
+	return ln, srv, pport, nil
 }
 
 func (m *Manager) ProjectsRoot() string {
@@ -199,7 +254,25 @@ func (m *Manager) Start(name string, portOverride int) error {
 		port = portOverride
 	}
 	if port > 0 && !portAvailable(port) {
-		return fmt.Errorf("%w: %d", ErrPortInUse, port)
+		// Port is in use. If we don't track any running process for this name,
+		// it may be an orphan from a previous Rover session — kill it.
+		m.mu.Lock()
+		_, tracked := m.procs[name]
+		m.mu.Unlock()
+		if !tracked {
+			m.logf("port %d is occupied by an untracked process; attempting to free it", port)
+			if err := killProcessOnPort(port); err != nil {
+				m.logf("failed to free port %d: %v", port, err)
+				return fmt.Errorf("%w: %d", ErrPortInUse, port)
+			}
+			m.logf("freed port %d", port)
+			// Re-check
+			if !portAvailable(port) {
+				return fmt.Errorf("%w: %d", ErrPortInUse, port)
+			}
+		} else {
+			return fmt.Errorf("%w: %d", ErrPortInUse, port)
+		}
 	}
 
 	startCmd := composeStartCmd(proj.StartCmd, port)
@@ -264,6 +337,19 @@ func (m *Manager) Start(name string, portOverride int) error {
 	m.mu.Unlock()
 
 	go rp.captureOutput(stdout, stderr)
+
+	if proj.ProxyEnabled {
+		proxyLn, proxySrv, pport, err := startProxy(m.bindHost, port)
+		if err != nil {
+			m.logf("launcher: proxy for %s: %v", name, err)
+		} else {
+			rp.proxyLn = proxyLn
+			rp.proxyServer = proxySrv
+			rp.info.ProxyPort = pport
+			rp.info.ProxyURL = fmt.Sprintf("http://%s:%d", proxyURLHost(m.bindHost), pport)
+		}
+	}
+
 	return nil
 }
 
@@ -276,6 +362,16 @@ func (m *Manager) Stop(name string) error {
 	}
 	delete(m.procs, name)
 	m.mu.Unlock()
+
+	// Shutdown proxy listener first
+	if rp.proxyServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		rp.proxyServer.Shutdown(ctx)
+	}
+	if rp.proxyLn != nil {
+		rp.proxyLn.Close()
+	}
 
 	err := killProcess(rp.cmd)
 	rp.cancel()
@@ -688,6 +784,24 @@ func (m *Manager) UpdateProjectPort(name string, port int) (*ProjectInfo, error)
 	return &p, nil
 }
 
+// UpdateProjectCommand updates the start command for a project.
+func (m *Manager) UpdateProjectCommand(name, startCmd string) (*ProjectInfo, error) {
+	if startCmd == "" {
+		return nil, fmt.Errorf("start command must not be empty")
+	}
+	reg := loadRoverRegistry(m.registryPath)
+	p, ok := reg.Projects[name]
+	if !ok {
+		return nil, fmt.Errorf("project %q not found", name)
+	}
+	p.StartCmd = startCmd
+	reg.Projects[name] = p
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
 // GetProject returns the project info for a given name, or nil if not found.
 func (m *Manager) GetProject(name string) *ProjectInfo {
 	projects := m.Scan()
@@ -784,4 +898,55 @@ func killProcess(cmd *exec.Cmd) error {
 		return nil
 	}
 	return killChildProcesses(cmd)
+}
+
+// killProcessOnPort finds and kills any process listening on the given TCP port.
+func killProcessOnPort(port int) error {
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("netstat", "-ano")
+		out, err := cmd.Output()
+		if err != nil {
+			return fmt.Errorf("netstat failed: %w", err)
+		}
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "LISTENING") && strings.Contains(line, ":"+strconv.Itoa(port)+" ") {
+				fields := strings.Fields(line)
+				if len(fields) > 4 {
+					pid := strings.TrimSpace(fields[len(fields)-1])
+					if pid == "" || pid == strconv.Itoa(os.Getpid()) {
+						continue
+					}
+					kill := exec.Command("taskkill", "/F", "/PID", pid)
+					if err := kill.Run(); err != nil {
+						return fmt.Errorf("failed to kill PID %s: %w", pid, err)
+					}
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("no process found listening on port %d", port)
+	}
+	// Unix: use lsof to find the PID, then kill it.
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("lsof -ti :%d", port))
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("no process found on port %d: %w", port, err)
+	}
+	pids := strings.Fields(string(out))
+	if len(pids) == 0 {
+		return fmt.Errorf("no process found on port %d", port)
+	}
+	for _, pid := range pids {
+		pid = strings.TrimSpace(pid)
+		if pid == "" || pid == strconv.Itoa(os.Getpid()) {
+			continue
+		}
+		kill := exec.Command("kill", "-9", pid)
+		if err := kill.Run(); err != nil {
+			return fmt.Errorf("failed to kill PID %s: %w", pid, err)
+		}
+	}
+	return nil
 }
