@@ -31,5 +31,9 @@ Thumbs.db
 projects_registry.json
 sessions.json
 
+# Machine-local launcher + secret (never committed)
+serve.local.ps1
+rover.secret.env
+
 # Claude Code settings
 .claude/

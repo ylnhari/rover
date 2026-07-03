@@ -19,6 +19,15 @@ Rover uses [Semantic Versioning](https://semver.org/).
   bind Rover to your Tailscale IP and the proxies are private to your tailnet.
 
 ### Changed
+- **Web UI redesign.** Refreshed the whole dark theme — cohesive palette, depth,
+  type hierarchy, a centered reading column for the Terminal, status pills / chips for
+  projects, a real empty state, and toast notifications. All native browser dialogs
+  (`alert` / `prompt` / `confirm`) are replaced with in-app toasts and modals
+  (Edit Port, Edit Command, Remove-project confirm, port-in-use override). No new
+  dependencies or build step; still a single embedded document.
+- **Terminal history restores command output after a reload.** The lightweight
+  `/api/sessions` list omits stdout/stderr; the UI now lazily fetches each completed
+  session's detail so its output reappears instead of showing only the exit code.
 - **Projects now use an explicit, registered port instead of self-discovery.** When
   adding a project you supply the port; rover stores it and passes it to the app at
   launch as `--port <port>` (or substitutes a `{port}` placeholder in the start command).
