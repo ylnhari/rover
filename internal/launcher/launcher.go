@@ -820,6 +820,12 @@ func (m *Manager) Adopt(name string) (*RunningProject, error) {
 		done: make(chan struct{}),
 	}
 	rp.appendOutput(fmt.Sprintf("[rover] adopted %s listening on port %d (not started by rover; Stop detaches without killing)\n", desc, proj.Port))
+	if !res.HTTP {
+		// The adoptee accepts TCP but never answered the probe's GET — often a
+		// wedged leftover instance. Say so here, where the user will look when
+		// the proxied link 502s, and name the way out of the adopt loop.
+		rp.appendOutput(fmt.Sprintf("[rover] warning: the process on port %d accepted a connection but did not answer an HTTP request — links to it may fail (proxy 502). If the app is stuck, use Kill & start instead of Adopt.\n", proj.Port))
+	}
 
 	m.mu.Lock()
 	if _, ok := m.procs[name]; ok {

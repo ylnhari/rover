@@ -2222,7 +2222,7 @@ html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
 (isTask?'':'<span class="meta-chip">Port <b>'+(p.port||'—')+'</b></span>')+
 kindChip+
 '<span id="url-'+esc(p.name)+'">'+urlHtml+'</span>'+
-(proxyUrlHtml?'<span id="proxyurl-'+esc(p.name)+'">'+proxyUrlHtml+'</span>':'')+
+'<span id="proxyurl-'+esc(p.name)+'">'+proxyUrlHtml+'</span>'+
 proxyErrHtml+
 '</div>'+
 '<div class="project-actions">'+
@@ -2304,6 +2304,14 @@ const pill=$('pill-'+name);
 if(!pill)return;
 pill.className='status-pill '+cls;
 pill.innerHTML='<span class="status-dot"></span>'+label;
+}
+// A stopped project has no reachable URLs; leaving stale links up would be
+// exactly the dead-link trap the verified-link work removed.
+function clearLinks(name){
+const uEl=$('url-'+name);
+if(uEl)uEl.innerHTML='';
+const pEl=$('proxyurl-'+name);
+if(pEl)pEl.innerHTML='';
 }
 
 window.startProject=async function(name,portOverride,killOpts){
@@ -2458,6 +2466,7 @@ setPill(name,'failed','Failed (exit '+exitCode+')');
 }else{
 setPill(name,'stopped','Stopped');
 }
+clearLinks(name);
 endButtons();
 }
 }catch(e){}
@@ -2483,6 +2492,7 @@ activeStreams[name].close();
 delete activeStreams[name];
 }
 setPill(name,'stopped','Stopped');
+clearLinks(name);
 const startBtn=$('start-'+name);
 const stopBtn=$('stop-'+name);
 if(startBtn)startBtn.disabled=false;
