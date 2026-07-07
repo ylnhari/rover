@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -553,7 +554,39 @@ func TestProjectFiles(t *testing.T) {
 	}
 }
 
+// TestHelperHTTPServer is not a real test: it is re-executed as a child
+// process by tests that need a genuine HTTP server for the validation probe.
+// It listens on 127.0.0.1:$PORT until killed.
+func TestHelperHTTPServer(t *testing.T) {
+	if os.Getenv("ROVER_TEST_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		t.Fatal("PORT not set")
+	}
+	srv := &http.Server{
+		Addr: "127.0.0.1:" + port,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "helper ok")
+		}),
+	}
+	srv.ListenAndServe()
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
+}
+
 func TestAddAndRemoveProject(t *testing.T) {
+	t.Setenv("ROVER_TEST_HELPER", "1")
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, "testapp"), 0755)
 
@@ -561,36 +594,41 @@ func TestAddAndRemoveProject(t *testing.T) {
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
-	// Add project
-	var shell, flag, startCmd string
-	if isWindows() {
-		shell, flag = "cmd", "/C"
-		startCmd = `cmd /C echo http://127.0.0.1:9999`
-	} else {
-		shell, flag = "sh", "-c"
-		startCmd = `sh -c 'echo http://127.0.0.1:9999'`
-	}
-	_ = shell
-	_ = flag
+	// Registration now requires a real listener: re-exec this test binary as
+	// an HTTP server (see TestHelperHTTPServer). The {port} placeholder is
+	// absorbed by a harmless -test.skip regex so no --port flag is appended;
+	// the helper reads the PORT env var.
+	startCmd := os.Args[0] + " -test.run=^TestHelperHTTPServer$ -test.skip=p{port}"
+	port := freeTCPPort(t)
 
-	body := fmt.Sprintf(`{"name":"testapp","start_cmd":"%s","port":9999}`, startCmd)
+	body := fmt.Sprintf(`{"name":"testapp","start_cmd":%q,"port":%d}`, startCmd, port)
 	resp := postJSON(t, ts.URL+"/api/projects", body, token)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		t.Fatalf("want 200/201, got %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("want 200/201, got %d: %s", resp.StatusCode, b)
 	}
 
 	var proj struct {
-		Name string `json:"name"`
-		Port int    `json:"port"`
-		URL  string `json:"url"`
+		Name   string `json:"name"`
+		Port   int    `json:"port"`
+		URL    string `json:"url"`
+		Report struct {
+			Probe struct {
+				Listening bool `json:"listening"`
+				HTTP      bool `json:"http"`
+			} `json:"probe"`
+		} `json:"report"`
 	}
 	json.NewDecoder(resp.Body).Decode(&proj)
 	if proj.Name != "testapp" {
 		t.Errorf("want testapp, got %q", proj.Name)
 	}
-	if proj.Port != 9999 {
-		t.Errorf("want port 9999, got %d", proj.Port)
+	if proj.Port != port {
+		t.Errorf("want port %d, got %d", port, proj.Port)
+	}
+	if !proj.Report.Probe.Listening || !proj.Report.Probe.HTTP {
+		t.Errorf("expected listening+http probe in response, got %+v", proj.Report)
 	}
 
 	// List and confirm

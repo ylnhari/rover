@@ -22,23 +22,23 @@ type StreamEvent struct {
 }
 
 type SessionSummary struct {
-	ID        string         `json:"id"`
-	Command   string         `json:"command"`
-	Status    SessionStatus  `json:"status"`
-	StartTime time.Time      `json:"start_time"`
-	EndTime   *time.Time     `json:"end_time,omitempty"`
-	ExitCode  int            `json:"exit_code"`
+	ID        string        `json:"id"`
+	Command   string        `json:"command"`
+	Status    SessionStatus `json:"status"`
+	StartTime time.Time     `json:"start_time"`
+	EndTime   *time.Time    `json:"end_time,omitempty"`
+	ExitCode  int           `json:"exit_code"`
 }
 
 type SessionDetail struct {
-	ID        string         `json:"id"`
-	Command   string         `json:"command"`
-	Status    SessionStatus  `json:"status"`
-	StartTime time.Time      `json:"start_time"`
-	EndTime   *time.Time     `json:"end_time,omitempty"`
-	ExitCode  int            `json:"exit_code"`
-	Stdout    string         `json:"stdout"`
-	Stderr    string         `json:"stderr"`
+	ID        string        `json:"id"`
+	Command   string        `json:"command"`
+	Status    SessionStatus `json:"status"`
+	StartTime time.Time     `json:"start_time"`
+	EndTime   *time.Time    `json:"end_time,omitempty"`
+	ExitCode  int           `json:"exit_code"`
+	Stdout    string        `json:"stdout"`
+	Stderr    string        `json:"stderr"`
 }
 
 type PingResponse struct {

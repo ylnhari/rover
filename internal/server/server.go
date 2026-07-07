@@ -268,6 +268,22 @@ func (sm *SessionManager) List() []*Session {
 	return result
 }
 
+// DeleteAll removes every non-running session from memory and disk.
+// Running sessions are left alone so an in-flight command isn't orphaned.
+func (sm *SessionManager) DeleteAll() {
+	sm.mu.Lock()
+	for id, s := range sm.sessions {
+		s.mu.RLock()
+		running := s.Status == StatusRunning
+		s.mu.RUnlock()
+		if !running {
+			delete(sm.sessions, id)
+		}
+	}
+	sm.mu.Unlock()
+	sm.persistAllToDisk()
+}
+
 func (sm *SessionManager) execute(s *Session) {
 	sm.mu.RLock()
 	execTimeout := sm.execTimeout
@@ -431,6 +447,12 @@ type Config struct {
 	// stateful commands that can't work in rover's non-interactive shell.
 	// Default (false) = guard enabled.
 	DisableCommandGuard bool
+	// ProxyAuthOn gates project reverse proxies behind a signed rover cookie
+	// (resolved from --proxy-auth by the CLI).
+	ProxyAuthOn bool
+	// ValidationTimeout bounds how long project registration / start probes
+	// wait for the app to begin listening.
+	ValidationTimeout time.Duration
 }
 
 type Server struct {
@@ -520,6 +542,7 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("POST /api/auth", s.handleLogin)
 	mux.HandleFunc("GET /api/sessions", s.requireAuth(s.handleListSessions))
 	mux.HandleFunc("POST /api/sessions", s.requireAuth(s.handleCreateSession))
+	mux.HandleFunc("DELETE /api/sessions", s.requireAuth(s.handleClearSessions))
 	mux.HandleFunc("GET /api/sessions/{id}", s.requireAuth(s.handleGetSession))
 	mux.HandleFunc("GET /api/sessions/{id}/stream", s.requireAuth(s.handleSessionStream))
 	mux.HandleFunc("GET /api/config", s.requireAuth(s.handleGetConfig))
@@ -532,19 +555,23 @@ func New(cfg Config) *Server {
 		})
 		// Project proxies inherit rover's own bind interface so they are never
 		// reachable from a network rover itself is not exposed to.
-		if host, _, err := net.SplitHostPort(cfg.Addr); err == nil {
+		if host, port, err := net.SplitHostPort(cfg.Addr); err == nil {
 			s.launcher.SetBindHost(host)
+			s.launcher.SetProxyAuth(cfg.ProxyAuthOn, cfg.Secret, port, cfg.CertFile != "" && cfg.KeyFile != "")
 		}
+		s.launcher.SetProbeTimeout(cfg.ValidationTimeout)
 		mux.HandleFunc("GET /api/projects", s.requireAuth(s.handleListProjects))
 		mux.HandleFunc("POST /api/projects", s.requireAuth(s.handleAddProject))
 		mux.HandleFunc("PUT /api/projects/{name}", s.requireAuth(s.handleUpdateProject))
 		mux.HandleFunc("DELETE /api/projects/{name}", s.requireAuth(s.handleRemoveProject))
 		mux.HandleFunc("POST /api/projects/{name}/start", s.requireAuth(s.handleStartProject))
 		mux.HandleFunc("POST /api/projects/{name}/stop", s.requireAuth(s.handleStopProject))
+		mux.HandleFunc("POST /api/projects/{name}/adopt", s.requireAuth(s.handleAdoptProject))
 		mux.HandleFunc("GET /api/projects/{name}/stream", s.requireAuth(s.handleProjectStream))
 		mux.HandleFunc("GET /api/projects/dirs", s.requireAuth(s.handleListProjectDirs))
 		mux.HandleFunc("GET /api/projects/{name}/files", s.requireAuth(s.handleListProjectFiles))
 		mux.HandleFunc("PUT /api/projects/{name}/proxy", s.requireAuth(s.handleToggleProxy))
+		mux.HandleFunc("GET /api/proxy-cookie", s.requireAuth(s.handleProxyCookie))
 	}
 
 	s.mux = mux
@@ -646,6 +673,41 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(summaries)
 }
 
+func (s *Server) handleClearSessions(w http.ResponseWriter, r *http.Request) {
+	s.sessions.DeleteAll()
+	s.logger.Info("sessions cleared", "src", r.RemoteAddr)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// commandPermitted enforces the --allow prefix allowlist and the interactive-
+// command guard. It applies to exec sessions AND project start commands (at
+// registration/update time), so the allowlist is one consistent boundary. On
+// rejection it writes the error response and returns false.
+func (s *Server) commandPermitted(w http.ResponseWriter, r *http.Request, command string) bool {
+	if len(s.cfg.AllowCmds) > 0 {
+		allowed := false
+		for _, prefix := range s.cfg.AllowCmds {
+			if strings.HasPrefix(command, prefix) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			s.logger.Warn("command blocked by allowlist", "src", r.RemoteAddr, "cmd", command)
+			jsonError(w, "command not permitted by server allowlist", http.StatusForbidden)
+			return false
+		}
+	}
+	if !s.cfg.DisableCommandGuard {
+		if blocked, reason := commandGuard(command); blocked {
+			s.logger.Warn("command blocked by guard", "src", r.RemoteAddr, "cmd", command)
+			jsonError(w, "blocked: "+reason, http.StatusUnprocessableEntity)
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxCommandBytes+512))
 	if err != nil {
@@ -669,27 +731,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(s.cfg.AllowCmds) > 0 {
-		allowed := false
-		for _, prefix := range s.cfg.AllowCmds {
-			if strings.HasPrefix(req.Command, prefix) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			s.logger.Warn("command blocked by allowlist", "src", r.RemoteAddr, "cmd", req.Command)
-			jsonError(w, "command not permitted by server allowlist", http.StatusForbidden)
-			return
-		}
-	}
-
-	if !s.cfg.DisableCommandGuard {
-		if blocked, reason := commandGuard(req.Command); blocked {
-			s.logger.Warn("command blocked by guard", "src", r.RemoteAddr, "cmd", req.Command)
-			jsonError(w, "blocked: "+reason, http.StatusUnprocessableEntity)
-			return
-		}
+	if !s.commandPermitted(w, r, req.Command) {
+		return
 	}
 
 	s.logger.Info("exec", "src", r.RemoteAddr, "cmd", req.Command)
@@ -813,10 +856,13 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 
 	type projectView struct {
 		launcher.ProjectInfo
-		IsRunning bool   `json:"is_running"`
-		URL       string `json:"running_url,omitempty"`
-		StartedAt string `json:"started_at,omitempty"`
-		ProxyURL  string `json:"proxy_url,omitempty"`
+		IsRunning  bool                 `json:"is_running"`
+		State      string               `json:"state,omitempty"`
+		URL        string               `json:"running_url,omitempty"`
+		StartedAt  string               `json:"started_at,omitempty"`
+		ProxyURL   string               `json:"proxy_url,omitempty"`
+		ProxyError string               `json:"proxy_error,omitempty"`
+		LastExit   *launcher.ExitStatus `json:"last_exit,omitempty"`
 	}
 
 	runMap := make(map[string]launcher.RunningProject)
@@ -829,13 +875,19 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		v := projectView{ProjectInfo: p}
 		if rp, ok := runMap[p.Name]; ok {
 			v.IsRunning = true
+			v.State = rp.State
 			v.URL = rp.URL
-			v.Port = rp.Port
+			if rp.Port > 0 {
+				v.Port = rp.Port
+			}
 			v.ProjectInfo.URL = rp.URL
 			v.StartedAt = rp.StartTime.Format(time.RFC3339)
 			if p.ProxyEnabled && rp.ProxyURL != "" {
 				v.ProxyURL = rp.ProxyURL
 			}
+			v.ProxyError = rp.ProxyError
+		} else {
+			v.LastExit = s.launcher.LastExit(p.Name)
 		}
 		views = append(views, v)
 	}
@@ -847,22 +899,37 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStartProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 
-	// Optional one-off port override for this start only (e.g. when the default
-	// port is occupied). An empty body means "use the registered default".
+	// Optional one-off port override for this start only, and the explicit
+	// confirmed-kill escape hatch for an occupied port: kill_occupant is only
+	// honored when confirm_pid matches the current listener (see launcher).
+	// An empty body means "use the registered default".
 	var body struct {
-		Port int `json:"port"`
+		Port         int  `json:"port"`
+		KillOccupant bool `json:"kill_occupant"`
+		ConfirmPID   int  `json:"confirm_pid"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(io.LimitReader(r.Body, 256)).Decode(&body)
+		_ = json.NewDecoder(io.LimitReader(r.Body, 512)).Decode(&body)
+	}
+	if body.KillOccupant {
+		s.logger.Warn("confirmed kill requested", "src", r.RemoteAddr, "project", name, "pid", body.ConfirmPID)
 	}
 
-	if err := s.launcher.Start(name, body.Port); err != nil {
-		if errors.Is(err, launcher.ErrPortInUse) {
+	err := s.launcher.Start(name, launcher.StartOptions{
+		PortOverride: body.Port,
+		KillOccupant: body.KillOccupant,
+		ConfirmPID:   body.ConfirmPID,
+	})
+	if err != nil {
+		var conflict *launcher.PortConflictError
+		if errors.As(err, &conflict) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]any{
 				"error":       err.Error(),
 				"port_in_use": true,
+				"port":        conflict.Port,
+				"occupant":    conflict.Occupant,
 			})
 			return
 		}
@@ -872,6 +939,20 @@ func (s *Server) handleStartProject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"status": "starting", "name": name})
+}
+
+// handleAdoptProject attaches rover (tracking + proxy) to a process already
+// listening on the project's registered port, instead of killing/restarting it.
+func (s *Server) handleAdoptProject(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	info, err := s.launcher.Adopt(name)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.logger.Info("adopted project", "src", r.RemoteAddr, "project", name, "port", info.Port, "pid", info.PID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *Server) handleStopProject(w http.ResponseWriter, r *http.Request) {
@@ -946,15 +1027,32 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "a valid port is required", http.StatusBadRequest)
 		return
 	}
-
-	p, err := s.launcher.AddProject(body.Name, body.StartCmd, body.Port)
-	if err != nil {
-		jsonError(w, err.Error(), http.StatusBadRequest)
+	if !s.commandPermitted(w, r, body.StartCmd) {
 		return
 	}
 
+	p, report, err := s.launcher.AddProject(body.Name, body.StartCmd, body.Port)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":  err.Error(),
+			"report": report,
+		})
+		return
+	}
+	s.logger.Info("project added", "src", r.RemoteAddr, "project", body.Name, "port", body.Port)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(p)
+	json.NewEncoder(w).Encode(map[string]any{
+		"name":          p.Name,
+		"path":          p.Path,
+		"port":          p.Port,
+		"start_cmd":     p.StartCmd,
+		"url":           p.URL,
+		"proxy_enabled": p.ProxyEnabled,
+		"report":        report,
+	})
 }
 
 func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
@@ -965,6 +1063,9 @@ func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 512)).Decode(&body); err != nil {
 		jsonError(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if body.StartCmd != "" && !s.commandPermitted(w, r, body.StartCmd) {
 		return
 	}
 
@@ -1117,6 +1218,34 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// proxyCookie builds the HttpOnly cookie that authenticates the browser to
+// project proxies. Cookies are scoped per-host (not per-port), so a cookie set
+// while talking to rover is presented to every proxy port on the same host.
+func proxyCookie(token string) *http.Cookie {
+	return &http.Cookie{
+		Name:     "rover_proxy",
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(auth.TokenTTL.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+// handleProxyCookie lets an already-authenticated UI session mint the proxy
+// cookie (requireAuth has verified the token before this runs). The UI calls
+// it before following a ?next= redirect back to a proxied app.
+func (s *Server) handleProxyCookie(w http.ResponseWriter, r *http.Request) {
+	token := r.Header.Get("X-Rover-Secret")
+	if token == "" {
+		token = r.URL.Query().Get("secret")
+	}
+	if token != "" {
+		http.SetCookie(w, proxyCookie(token))
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"required": s.cfg.Secret != ""})
@@ -1154,6 +1283,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ip2, _, _ := net.SplitHostPort(r.RemoteAddr)
 	s.logger.Info("login", "src", ip2)
 	expiresAt := time.Now().Add(auth.TokenTTL).UTC().Format(time.RFC3339)
+	// The same signed token doubles as the proxy-auth cookie: cookies are
+	// per-host, so it authenticates this browser to every proxy port too.
+	http.SetCookie(w, proxyCookie(token))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": token, "expires_at": expiresAt})
 }
@@ -1925,9 +2057,33 @@ cmdEl.focus();
 }
 }
 
-function initApp(){
+// When a proxy redirected the browser here to authenticate (?next=...), mint
+// the proxy cookie and bounce back. The target must be same-host http(s) so
+// this can never be an open redirect.
+async function handleProxyNext(){
+const next=new URLSearchParams(location.search).get('next');
+if(!next)return false;
+try{
+const u=new URL(next);
+if(u.hostname!==location.hostname||(u.protocol!=='http:'&&u.protocol!=='https:'))return false;
+await fetch('/api/proxy-cookie',{headers:{'X-Rover-Secret':getToken()}});
+location.replace(next);
+return true;
+}catch(e){return false;}
+}
+
+async function initApp(){
+if(await handleProxyNext())return;
 runBtn.addEventListener('click',run);
-newChatBtn.addEventListener('click',()=>{historyEl.innerHTML='';showEmptyState()});
+newChatBtn.addEventListener('click',async()=>{
+const ok=await uiConfirm({title:'Clear history',message:'Delete all saved command history from the server? Running commands are left untouched.',okLabel:'Clear',danger:true});
+if(!ok)return;
+try{
+const r=await fetch('/api/sessions',{method:'DELETE',headers:{'X-Rover-Secret':getToken()}});
+if(!r.ok){toast('Failed to clear history: '+r.status,'err');return}
+}catch(e){toast('Failed to clear history: '+e.message,'err');return}
+historyEl.innerHTML='';showEmptyState();
+});
 loadHistory();
 
 // ── Tab switching ─────────────────────────────────────
@@ -1978,9 +2134,11 @@ let html='<div class="projects-grid">';
 for(const p of projects){
 const status=determineStatus(p);
 const dotCls=status==='running'?'running':status==='starting'?'starting':status==='failed'?'failed':'stopped';
-const statusLabel=status==='running'?'Running':status==='starting'?'Starting':status==='failed'?'Failed':'Stopped';
+const statusLabel=statusLabelFor(p,status);
 const urlHtml=p.running_url?'<a href="'+esc(p.running_url)+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(p.running_url)+'</a>':'';
-const proxyUrlHtml=p.proxy_url?'<a href="'+esc(p.proxy_url)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(p.proxy_url)+'</a>':'';
+const proxyHref=p.proxy_url?displayUrl(p.proxy_url):'';
+const proxyUrlHtml=proxyHref?'<a href="'+esc(proxyHref)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(proxyHref)+'</a>':'';
+const proxyErrHtml=p.proxy_error?'<span class="meta-chip" style="color:#e5484d" title="'+esc(p.proxy_error)+'">⚠ proxy failed</span>':'';
 const proxyLabel=p.proxy_enabled?'Proxy ON':'Proxy OFF';
 const proxyBtnCls=p.proxy_enabled?'btn-proxy-on':'btn-proxy-off';
 html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
@@ -1993,10 +2151,11 @@ html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
 '<span class="meta-chip">Port <b>'+(p.port||'—')+'</b></span>'+
 '<span id="url-'+esc(p.name)+'">'+urlHtml+'</span>'+
 (proxyUrlHtml?'<span id="proxyurl-'+esc(p.name)+'">'+proxyUrlHtml+'</span>':'')+
+proxyErrHtml+
 '</div>'+
 '<div class="project-actions">'+
 '<button class="btn btn-primary btn-start" id="start-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'||status==='starting'?'disabled':'')+'>Start</button>'+
-'<button class="btn btn-danger btn-stop" id="stop-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'?'':'disabled')+'>Stop</button>'+
+'<button class="btn btn-danger btn-stop" id="stop-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'||status==='starting'?'':'disabled')+'>Stop</button>'+
 '<button class="btn btn-ghost btn-log" id="log-'+esc(p.name)+'" data-project="'+esc(p.name)+'">Log</button>'+
 '<span class="spacer"></span>'+
 '<button class="btn btn-ghost btn-port" id="port-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-port="'+(p.port||'')+'">Port</button>'+
@@ -2020,8 +2179,10 @@ if(p.is_running&&!activeStreams[p.name]){
 connectProjectStream(p.name);
 }
 }
+}
 
-// Event delegation for project buttons (avoids inline onclick JS string injection)
+// Event delegation for project buttons, attached ONCE (renderProjects replaces
+// innerHTML, so per-render listeners would stack and fire actions N times).
 projectsView.addEventListener('click',function(e){
 const btn=e.target.closest('[data-project]');
 if(!btn)return;
@@ -2034,11 +2195,22 @@ else if(btn.classList.contains('btn-remove')){e.stopPropagation();removeProject(
 else if(btn.classList.contains('btn-proxy-on')||btn.classList.contains('btn-proxy-off'))toggleProxy(name);
 else if(btn.classList.contains('btn-cmd'))editCommand(name);
 });
-}
 
 function determineStatus(p){
-if(p.is_running)return'running';
+if(p.is_running)return p.state==='starting'?'starting':'running';
+if(p.last_exit&&!p.last_exit.stopped&&p.last_exit.code!==0)return'failed';
 return'stopped';
+}
+function statusLabelFor(p,status){
+if(status==='failed')return'Failed (exit '+p.last_exit.code+')';
+if(status==='starting')return'Starting';
+if(status==='running')return p.state==='adopted'?'Adopted':'Running';
+return'Stopped';
+}
+// Rewrite a URL to the host the browser actually used to reach rover, so the
+// link works from wherever you are (tailnet, LAN, localhost).
+function displayUrl(u){
+try{const p=new URL(u);p.hostname=location.hostname;return p.toString();}catch(e){return u;}
 }
 
 function setPill(name,cls,label){
@@ -2048,7 +2220,7 @@ pill.className='status-pill '+cls;
 pill.innerHTML='<span class="status-dot"></span>'+label;
 }
 
-window.startProject=async function(name,portOverride){
+window.startProject=async function(name,portOverride,killOpts){
 const startBtn=$('start-'+name);
 const stopBtn=$('stop-'+name);
 if(!startBtn)return;
@@ -2056,23 +2228,24 @@ setPill(name,'starting','Starting');
 startBtn.disabled=true;
 if(stopBtn)stopBtn.disabled=true;
 try{
-const body=portOverride?JSON.stringify({port:portOverride}):'';
+const payload={};
+if(portOverride)payload.port=portOverride;
+if(killOpts&&killOpts.pid){payload.kill_occupant=true;payload.confirm_pid=killOpts.pid;}
+const body=Object.keys(payload).length?JSON.stringify(payload):'';
 const r=await fetch('/api/projects/'+encodeURIComponent(name)+'/start',{method:'POST',headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},body:body});
 if(!r.ok){
 const e=await r.json();
 setPill(name,'stopped','Stopped');
 startBtn.disabled=false;
+if(stopBtn)stopBtn.disabled=true;
 if(r.status===409&&e.port_in_use){
-// Occupied port — offer a one-off alternative for THIS start only.
-const ans=await uiPrompt({title:'Port in use',label:(e.error||'Port in use')+'. Enter a different port for this start:',type:'number',value:'',placeholder:'e.g. 8790',okLabel:'Start',note:'The saved default port is unchanged.'});
-const np=parseInt(ans,10);
-if(np>0)startProject(name,np);
+await resolvePortConflict(name,portOverride,e);
 return;
 }
 toast('Failed to start: '+(e.error||r.status),'err');
 return;
 }
-setPill(name,'running','Running');
+// Stay on "Starting" until the server confirms a listener (ready event).
 if(stopBtn)stopBtn.disabled=false;
 connectProjectStream(name);
 }catch(e){
@@ -2081,6 +2254,33 @@ startBtn.disabled=false;
 toast('Connection error: '+e.message,'err');
 }
 };
+
+// Port conflict: never kill silently. Offer, in order: adopt the existing
+// listener, kill it after explicit confirmation (PID echoed back so a process
+// that grabbed the port in between is never the one killed), or a one-off
+// alternative port.
+async function resolvePortConflict(name,portOverride,e){
+const occ=e.occupant;
+if(occ&&occ.pid){
+const desc='PID '+occ.pid+(occ.name?' ('+occ.name+')':'')+(occ.cmdline?' — '+occ.cmdline:'');
+const adopt=await uiConfirm({title:'Port '+(e.port||'')+' in use',message:'Port '+(e.port||'')+' is in use by '+desc+'. Adopt it — attach rover and its proxy to the process already running there?',okLabel:'Adopt'});
+if(adopt){
+try{
+const ar=await fetch('/api/projects/'+encodeURIComponent(name)+'/adopt',{method:'POST',headers:{'X-Rover-Secret':getToken()}});
+const ad=await ar.json();
+if(!ar.ok){toast('Adopt failed: '+(ad.error||ar.status),'err');return;}
+toast('Adopted running process on port '+ad.port,'ok');
+loadProjects();
+}catch(err){toast('Connection error: '+err.message,'err');}
+return;
+}
+const killOk=await uiConfirm({title:'Kill occupant?',message:'Kill '+desc+' and start "'+name+'" on port '+(e.port||'')+'? Only confirm if you are sure this process is safe to kill.',okLabel:'Kill and start',danger:true});
+if(killOk){startProject(name,portOverride,{pid:occ.pid});return;}
+}
+const ans=await uiPrompt({title:'Port in use',label:(e.error||'Port in use')+'. Enter a different port for this start:',type:'number',value:'',placeholder:'e.g. 8790',okLabel:'Start',note:'The saved default port is unchanged.'});
+const np=parseInt(ans,10);
+if(np>0)startProject(name,np);
+}
 
 window.editPort=async function(name,current){
 const ans=await uiPrompt({title:'Edit port',label:'Default port for "'+name+'"',type:'number',value:current||'',placeholder:'e.g. 8770',okLabel:'Save',note:'Rover passes it as --port on start.'});
@@ -2125,6 +2325,13 @@ const sec=getToken();
 const esUrl='/api/projects/'+encodeURIComponent(name)+'/stream'+(sec?'?secret='+encodeURIComponent(sec):'');
 const es=new EventSource(esUrl);
 activeStreams[name]=es;
+let exitCode=null;
+const endButtons=function(){
+const startBtn=$('start-'+name);
+const stopBtn=$('stop-'+name);
+if(startBtn)startBtn.disabled=false;
+if(stopBtn)stopBtn.disabled=true;
+};
 es.onmessage=function(event){
 try{
 const d=JSON.parse(event.data);
@@ -2132,37 +2339,44 @@ if(!outputEl)return;
 if(d.type==='stdout'||d.type==='stderr'){
 outputEl.textContent+=d.data;
 outputEl.scrollTop=outputEl.scrollHeight;
-// Extract URL from output
-const urlMatch=d.data.match(/https?:\/\/[^\s"'<>]+/);
-if(urlMatch){
-const urlEl=$('url-'+name);
-if(urlEl)urlEl.innerHTML='<a href="'+esc(urlMatch[0])+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(urlMatch[0])+'</a>';
-}
 }else if(d.type==='url'){
 const urlEl=$('url-'+name);
 if(urlEl)urlEl.innerHTML='<a href="'+esc(d.data)+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(d.data)+'</a>';
 if(outputEl){
 outputEl.innerHTML+='<div class="url-line">'+esc(d.data)+'</div>';
 }
+}else if(d.type==='ready'){
+// Listener confirmed on the port: NOW it is truthfully running.
+setPill(name,'running','Running');
+if(d.data){
+const urlEl=$('url-'+name);
+if(urlEl)urlEl.innerHTML='<a href="'+esc(d.data)+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(d.data)+'</a>';
+}
+const stopBtn=$('stop-'+name);
+if(stopBtn)stopBtn.disabled=false;
+}else if(d.type==='proxy'){
+const pEl=$('proxyurl-'+name);
+const href=displayUrl(d.data);
+if(pEl)pEl.innerHTML='<a href="'+esc(href)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(href)+'</a>';
+}else if(d.type==='exit'){
+exitCode=parseInt(d.data,10);
 }else if(d.type==='done'){
 es.close();
 delete activeStreams[name];
+if(exitCode!==null&&exitCode!==0){
+setPill(name,'failed','Failed (exit '+exitCode+')');
+}else{
 setPill(name,'stopped','Stopped');
-const startBtn=$('start-'+name);
-const stopBtn=$('stop-'+name);
-if(startBtn)startBtn.disabled=false;
-if(stopBtn)stopBtn.disabled=true;
+}
+endButtons();
 }
 }catch(e){}
 };
 es.onerror=function(){
 es.close();
 delete activeStreams[name];
-setPill(name,'stopped','Stopped');
-const startBtn=$('start-'+name);
-const stopBtn=$('stop-'+name);
-if(startBtn)startBtn.disabled=false;
-if(stopBtn)stopBtn.disabled=true;
+// Connection lost, not necessarily a stop — re-query the server for truth.
+loadProjects();
 };
 }
 
@@ -2295,7 +2509,7 @@ return;
 }
 btn.disabled=true;
 status.className='loading';
-status.textContent='Starting and validating project on port '+port+' (max 15 seconds)…';
+status.textContent='Starting the app and probing port '+port+' until it listens (up to 30 s)…';
 try{
 const r=await fetch('/api/projects',{
 method:'POST',
@@ -2305,12 +2519,18 @@ body:JSON.stringify({name:selectedDir,start_cmd:$('addStartCmd').value,port:port
 const data=await r.json();
 if(!r.ok){
 status.className='error';
-status.textContent='Failed: '+(data.error||'unknown error');
+let msg='Failed: '+(data.error||'unknown error');
+const rep=data.report;
+if(rep&&rep.exit_code!==undefined&&rep.exit_code!==null)msg='Failed: the app exited with code '+rep.exit_code+' before listening on port '+port+'.';
+else if(rep&&rep.probe&&!rep.probe.listening&&rep.log_tail!==undefined)msg='Failed: nothing listened on port '+port+' within the timeout.';
+if(rep&&rep.log_tail)msg+=' Output: '+rep.log_tail.slice(-400);
+status.textContent=msg;
 btn.disabled=false;
 return;
 }
 status.className='success';
-status.textContent='Project "'+selectedDir+'" added at '+data.url+' (port '+data.port+')';
+const boot=data.report&&data.report.probe?' ('+(data.report.probe.http?'HTTP':'TCP')+' confirmed in '+data.report.probe.boot_ms+' ms)':'';
+status.textContent='Project "'+selectedDir+'" added at '+data.url+boot;
 toast('Project "'+selectedDir+'" added','ok');
 setTimeout(()=>{
 closeAddProjectModal();
@@ -2352,6 +2572,10 @@ headers:{'Content-Type':'application/json','X-Rover-Secret':getToken()},
 body:JSON.stringify({enabled:newEnabled})
 });
 if(!r.ok){const e=await r.json();toast('Failed to toggle proxy: '+(e.error||r.status),'err');return;}
+const pill=$('pill-'+name);
+if(pill&&pill.textContent.indexOf('Stopped')===-1&&pill.textContent.indexOf('Failed')===-1){
+toast('Proxy '+(newEnabled?'enabled':'disabled')+' — takes effect on the next start','info');
+}
 loadProjects();
 }catch(e){toast('Connection error: '+e.message,'err');}
 };

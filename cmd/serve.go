@@ -5,13 +5,12 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ylnhari/rover/internal/launcher"
 	"github.com/ylnhari/rover/internal/server"
 )
 
@@ -32,9 +31,12 @@ func runServe(args []string) error {
 	execTimeout := fs.Duration("exec-timeout", 10*time.Minute, "max execution time per command (0 = no timeout)")
 	maxOutput := fs.Int64("max-output", 1*1024*1024, "max output bytes per command (0 = no limit)")
 	projectsDir := fs.String("projects-dir", "", "path to projects root (default: parent of rover directory)")
-	allow := fs.String("allow", "", "comma-separated command prefixes to allow (empty = allow all)")
+	allow := fs.String("allow", "", "comma-separated command prefixes to allow (empty = allow all); also applies to project start commands")
 	logFormat := fs.String("log-format", "text", "log output format: text or json")
 	noGuard := fs.Bool("no-command-guard", false, "allow interactive/GUI/stateful commands that normally can't work over rover (default: blocked)")
+	proxyAuth := fs.String("proxy-auth", "auto", "require rover login for project proxies: auto|on|off (auto = off on loopback/tailnet binds, on elsewhere)")
+	takeoverPort := fs.Bool("takeover-port", false, "if rover's own port is occupied, kill the listener instead of failing (default: fail and name the occupant)")
+	validationTimeout := fs.Duration("validation-timeout", 30*time.Second, "how long project registration/start probes wait for the app to start listening")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -44,12 +46,12 @@ func runServe(args []string) error {
 	if sec == "" {
 		sec = os.Getenv("ROVER_SECRET")
 	}
+	host, _, _ := net.SplitHostPort(*addr)
 	if sec == "" {
 		// Secret-less mode grants unauthenticated command execution, so it is
 		// only permitted when rover is bound to loopback. Binding to any other
 		// interface (including the all-interfaces default ":port") without a
 		// secret would expose the host to the network and is refused.
-		host, _, _ := net.SplitHostPort(*addr)
 		if isLoopbackBind(host) {
 			fmt.Println("WARNING: Running without a secret. Authentication is disabled, but rover is bound to loopback only.")
 		} else {
@@ -67,8 +69,16 @@ func runServe(args []string) error {
 		}
 	}
 
-	if err := ensurePortFree(*addr); err != nil {
-		return fmt.Errorf("failed to free port: %w", err)
+	proxyAuthOn, err := resolveProxyAuth(*proxyAuth, host, sec)
+	if err != nil {
+		return err
+	}
+	if !proxyAuthOn && !isLoopbackBind(host) && !isTailnetBind(host) {
+		fmt.Printf("WARNING: bound to %q with proxy auth OFF — every proxied project is reachable WITHOUT authentication on that network. Use --proxy-auth on, or bind to a Tailscale IP.\n", *addr)
+	}
+
+	if err := ensurePortFree(*addr, *takeoverPort); err != nil {
+		return err
 	}
 
 	projectsRoot := *projectsDir
@@ -93,18 +103,43 @@ func runServe(args []string) error {
 	}
 
 	return server.New(server.Config{
-		Addr:         *addr,
-		Secret:       sec,
-		CertFile:     *certFile,
-		KeyFile:      *keyFile,
-		ExecTimeout:  *execTimeout,
-		MaxOutput:    *maxOutput,
+		Addr:                *addr,
+		Secret:              sec,
+		CertFile:            *certFile,
+		KeyFile:             *keyFile,
+		ExecTimeout:         *execTimeout,
+		MaxOutput:           *maxOutput,
 		ProjectsRoot:        projectsRoot,
 		AllowCmds:           allowCmds,
 		SessionsFile:        defaultSessionsFile(),
 		LogFormat:           *logFormat,
 		DisableCommandGuard: *noGuard,
+		ProxyAuthOn:         proxyAuthOn,
+		ValidationTimeout:   *validationTimeout,
 	}).ListenAndServe()
+}
+
+// resolveProxyAuth turns the --proxy-auth mode into an effective on/off.
+// "auto" = off when the proxies can only be reached from trusted networks
+// (loopback, or a Tailscale CGNAT address where the tailnet's WireGuard device
+// auth is the boundary), on everywhere else (LAN / all-interfaces binds).
+func resolveProxyAuth(mode, host, secret string) (bool, error) {
+	switch mode {
+	case "on":
+		if secret == "" {
+			return false, fmt.Errorf("--proxy-auth on requires a secret")
+		}
+		return true, nil
+	case "off":
+		return false, nil
+	case "auto":
+		if secret == "" || isLoopbackBind(host) || isTailnetBind(host) {
+			return false, nil
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid --proxy-auth %q: use auto, on or off", mode)
+	}
 }
 
 // isLoopbackBind reports whether host refers only to the local machine. An
@@ -122,16 +157,49 @@ func isLoopbackBind(host string) bool {
 	return false
 }
 
-func ensurePortFree(addr string) error {
+// isTailnetBind reports whether host is a Tailscale CGNAT address
+// (100.64.0.0/10), where device-level WireGuard auth already gates access.
+func isTailnetBind(host string) bool {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return false
+	}
+	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
+	return cgnat.Contains(ip)
+}
+
+// ensurePortFree checks rover's own port. If occupied it names the listener
+// and fails, unless --takeover-port explicitly authorizes killing it.
+func ensurePortFree(addr string, takeover bool) error {
 	ln, err := net.Listen("tcp", addr)
 	if err == nil {
 		ln.Close()
 		return nil
 	}
 
-	fmt.Printf("Port %s is in use, attempting to kill the process...\n", addr)
-	if err := killProcessOnPort(addr); err != nil {
-		return fmt.Errorf("failed to kill process on %s: %w", addr, err)
+	_, portStr, perr := net.SplitHostPort(addr)
+	if perr != nil {
+		return fmt.Errorf("port check: %w", err)
+	}
+	port, perr := strconv.Atoi(portStr)
+	if perr != nil {
+		return fmt.Errorf("port check: %w", err)
+	}
+
+	occ := launcher.FindListenerOnPort(port)
+	if !takeover {
+		if occ != nil {
+			return fmt.Errorf("port %s is in use by %s — stop it, use a different --addr, or pass --takeover-port to kill it", addr, occ)
+		}
+		return fmt.Errorf("port %s is in use (listener could not be identified) — stop it or use a different --addr", addr)
+	}
+
+	if occ == nil {
+		return fmt.Errorf("port %s is in use but the listener could not be identified; refusing to take over", addr)
+	}
+	fmt.Printf("Port %s is in use by %s; --takeover-port set, killing it...\n", addr, occ)
+	if err := launcher.KillConfirmedListener(port, occ.PID); err != nil {
+		return fmt.Errorf("takeover failed: %w", err)
 	}
 
 	for i := 0; i < 5; i++ {
@@ -143,64 +211,5 @@ func ensurePortFree(addr string) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("port %s is still in use after kill attempt: %w", addr, err)
-}
-
-func killProcessOnPort(addr string) error {
-	_, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return err
-	}
-
-	switch runtime.GOOS {
-	case "windows":
-		cmd := exec.Command("netstat", "-ano")
-		out, err := cmd.Output()
-		if err != nil {
-			return fmt.Errorf("netstat failed: %w", err)
-		}
-		lines := strings.Split(string(out), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.Contains(line, "LISTENING") && strings.Contains(line, ":"+portStr+" ") {
-				fields := strings.Fields(line)
-				if len(fields) > 4 {
-					pid := fields[len(fields)-1]
-					kill := exec.Command("taskkill", "/F", "/PID", pid)
-					kill.Stdout = os.Stdout
-					kill.Stderr = os.Stderr
-					if err := kill.Run(); err != nil {
-						return fmt.Errorf("failed to kill PID %s: %w", pid, err)
-					}
-					fmt.Printf("Killed process PID %s on port %s\n", pid, portStr)
-					return nil
-				}
-			}
-		}
-		return fmt.Errorf("no process found listening on port %s", portStr)
-	default:
-		cmd := exec.Command("lsof", "-ti", ":"+portStr)
-		out, err := cmd.Output()
-		if err != nil {
-			return fmt.Errorf("no process found on port %s: %w", portStr, err)
-		}
-		pids := strings.Fields(string(out))
-		if len(pids) == 0 {
-			return fmt.Errorf("no process found on port %s", portStr)
-		}
-		for _, pid := range pids {
-			pid = strings.TrimSpace(pid)
-			if pid == "" || pid == strconv.Itoa(os.Getpid()) {
-				continue
-			}
-			kill := exec.Command("kill", "-9", pid)
-			kill.Stdout = os.Stdout
-			kill.Stderr = os.Stderr
-			if err := kill.Run(); err != nil {
-				return fmt.Errorf("failed to kill PID %s: %w", pid, err)
-			}
-			fmt.Printf("Killed process PID %s on port %s\n", pid, portStr)
-		}
-		return nil
-	}
+	return fmt.Errorf("port %s is still in use after takeover: %w", addr, err)
 }

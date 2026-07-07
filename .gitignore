@@ -35,5 +35,8 @@ sessions.json
 serve.local.ps1
 rover.secret.env
 
+# Claude personal/machine-local memory (template .example is committed)
+CLAUDE.local.md
+
 # Claude Code settings
 .claude/

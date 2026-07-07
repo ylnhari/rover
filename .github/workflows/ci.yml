@@ -18,7 +18,7 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: test
-        run: go test ./... -v -race -count=1 -timeout 60s
+        run: go test ./... -v -race -count=1 -timeout 180s
 
   build:
     name: Cross-compile ${{ matrix.goos }}/${{ matrix.goarch }}

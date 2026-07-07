@@ -25,4 +25,3 @@ func killChildProcesses(cmd *exec.Cmd) error {
 	}
 	return nil
 }
-

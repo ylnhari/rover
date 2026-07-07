@@ -30,21 +30,26 @@ Open [http://localhost:2278](http://localhost:2278) and log in with your secret.
 
 ### Project Launcher
 - **Start/stop projects** from the browser — Python scripts, Node servers, Go programs, etc.
-- **Auto URL detection** — Rover extracts the URL/port from stdout when a project starts
-- **Live console streaming** — view project logs in real time via SSE
-- **Reverse proxy (default ON)** — Rover can proxy requests to apps bound to `127.0.0.1`, making them accessible via Tailscale/LAN without changing app configuration. Toggle per-project in the dashboard.
-- **Persistent registry** — projects are saved to `projects_registry.json` (git-ignored)
+- **Real server validation** — registration and every start probe the port (TCP connect, then an HTTP request) until the app actually listens; the URL is only advertised once confirmed
+- **Honest lifecycle** — children are reaped on exit (no zombies); a crash shows **Failed (exit N)**, never a stale "Running"
+- **Safe port conflicts** — an occupied port is never freed by a silent kill: rover identifies the listener (PID, name, cmdline) and offers **Adopt** / confirmed **Kill & start** / another port
+- **Adopt running servers** — attach rover (tracking + proxy) to an app already listening on the project's port, e.g. one you started by hand
+- **Live console streaming** — view project logs in real time via SSE (bounded in-memory history)
+- **Reverse proxy (default ON)** — Rover can proxy requests to apps bound to `127.0.0.1`, making them accessible via Tailscale/LAN without changing app configuration. Proxy ports are stable across restarts (bookmarkable); the proxy stops forwarding the moment the app dies. Toggle per-project in the dashboard.
+- **Persistent registry** — projects are saved to `projects_registry.json` (git-ignored, atomic 0600 writes)
 - **Clean shutdown** — all launched projects are killed when Rover exits
 
 ### Security
 - **HMAC-SHA256 session tokens** — login returns a signed, time-limited token (24h TTL); the raw secret is never stored in the browser
 - **`X-Rover-Secret` header auth** — all protected endpoints require the token header
 - **Secret required off-loopback** — Rover refuses to start without a secret unless bound to `127.0.0.1`; secret-less mode can never expose the host to the network
+- **Proxy auth (`--proxy-auth auto|on|off`)** — project proxies can require the same rover login via a signed HttpOnly cookie; `auto` keeps them open on loopback/Tailscale binds (where the network is the boundary) and gates them everywhere else
 - **Rate-limited login** — 10 attempts per IP per minute
-- **Command allowlist** — `--allow git,go test,npm` blocks everything else
+- **Command allowlist** — `--allow git,go test,npm` blocks everything else, **including project start commands**
+- **No blind kills** — neither project start nor rover's own startup ever `kill -9`s a port occupant without explicit confirmation (`--takeover-port` / confirmed PID)
 - **Security headers** — `X-Frame-Options`, `X-Content-Type-Options`, `Content-Security-Policy`
 - **Optional TLS** — `--tls-cert` / `--tls-key`
-- **Structured audit log** — every exec and login event is logged with IP and timestamp
+- **Structured audit log** — every exec, login, project change, adopt and confirmed kill is logged with IP and timestamp
 
 ---
 
@@ -91,6 +96,12 @@ Flags:
   --projects-dir   path        projects root directory
   --log-format     text|json   log output format                     (default: text)
   --no-command-guard           allow interactive/GUI/stateful commands (default: blocked)
+  --proxy-auth     auto|on|off require rover login for project proxies (default: auto —
+                               off on loopback/Tailscale binds, on elsewhere)
+  --takeover-port              kill whatever holds rover's own port instead of failing
+                               with the occupant's identity (default: fail and name it)
+  --validation-timeout dur     how long registration/start probes wait for the app
+                               to start listening                    (default: 30s)
 ```
 
 ### Examples
@@ -140,6 +151,7 @@ All protected endpoints require the `X-Rover-Secret: <token>` header, where `<to
 | POST | `/api/auth` | — | Login — returns `{"token":"…","expires_at":"…"}` |
 | GET | `/api/sessions` | ✓ | List all sessions |
 | POST | `/api/sessions` | ✓ | Create and execute a command |
+| DELETE | `/api/sessions` | ✓ | Clear saved command history (running sessions untouched) |
 | GET | `/api/sessions/{id}` | ✓ | Get session detail (stdout, stderr, exit code) |
 | GET | `/api/sessions/{id}/stream` | ✓ | SSE real-time output stream |
 | GET | `/api/config` | ✓ | Get exec timeout and max output |
@@ -149,11 +161,13 @@ All protected endpoints require the `X-Rover-Secret: <token>` header, where `<to
 | DELETE | `/api/projects/{name}` | ✓ | Remove a project from the registry |
 | GET | `/api/projects/dirs` | ✓ | List available unregistered directories |
 | GET | `/api/projects/{name}/files` | ✓ | List eligible start files in a directory |
-| POST | `/api/projects/{name}/start` | ✓ | Start a project |
-| POST | `/api/projects/{name}/stop` | ✓ | Stop a running project |
-| GET | `/api/projects/{name}/stream` | ✓ | SSE live console output |
-| PUT | `/api/projects/{name}/proxy` | ✓ | Toggle reverse proxy on/off for a project |
-| | `http://<rover-addr>:<proxy-port>/` | — | Per-project reverse-proxy listener on a dedicated port (auto-assigned on start) |
+| POST | `/api/projects/{name}/start` | ✓ | Start a project; `409` + occupant identity on port conflict; accepts `{"kill_occupant":true,"confirm_pid":N}` |
+| POST | `/api/projects/{name}/stop` | ✓ | Stop a running project (detaches from adopted ones) |
+| POST | `/api/projects/{name}/adopt` | ✓ | Adopt a process already listening on the project's port |
+| GET | `/api/projects/{name}/stream` | ✓ | SSE live console output (`ready`, `exit`, `proxy` lifecycle events) |
+| PUT | `/api/projects/{name}/proxy` | ✓ | Toggle reverse proxy on/off for a project (applies on next start) |
+| GET | `/api/proxy-cookie` | ✓ | Set the signed proxy-auth cookie for this browser |
+| | `http://<rover-addr>:<proxy-port>/` | * | Per-project reverse-proxy listener on a stable dedicated port; gated by the rover cookie when `--proxy-auth` is on |
 
 ---
 
@@ -193,20 +207,52 @@ Browser ────────────────────────
 
 See [SECURITY.md](SECURITY.md) for the full threat model and responsible disclosure policy.
 
-**Summary:**
-- Always set `--secret` in any networked deployment
-- Restrict port access at the firewall level — Rover is not designed for the open internet
-- Use `--allow` to limit which commands can be executed
-- Enable TLS if traffic crosses an untrusted network
-- Rotate the secret periodically (existing tokens become invalid immediately)
+### What the rover password protects — and what it doesn't
+
+The secret gates **control**: every `/api/*` endpoint (exec, project start/stop/add,
+config). It does **not**, by itself, gate the **data** your proxied apps serve — each
+proxied project listens on its own port. Two mechanisms cover that gap:
+
+1. **Proxies bind rover's own interface** (the host part of `--addr`), so a proxy is
+   never reachable from a network rover itself is not.
+2. **`--proxy-auth`** additionally requires the rover login (via a signed HttpOnly
+   cookie) before a proxy forwards anything. `auto` (the default) resolves to **off**
+   on loopback and Tailscale (100.64.0.0/10) binds — there the network layer already
+   authenticates devices — and **on** for any other bind (LAN, `0.0.0.0`). Unauthenticated
+   browsers are redirected to rover's login once per 24 h; API clients can call
+   `GET /api/proxy-cookie`.
+
+### Deployment shapes
+
+| Bind (`--addr`) | Who can reach rover & proxies | Guidance |
+|---|---|---|
+| `127.0.0.1:2278` | this machine only | secret optional, proxy auth pointless (auto=off) |
+| `<tailscale-ip>:2278` | your tailnet devices | **recommended for phone→PC**; secret required, proxy auth auto=off (WireGuard device auth is the boundary) |
+| `:2278` / LAN IP | everyone on every network you join | secret required; proxy auth auto=**on**; rover warns loudly if you force it off |
+
+### Other rules that always hold
+
+- Rover **refuses to start** without a secret when bound off-loopback.
+- The `--allow` allowlist and the command guard apply to exec commands **and** project
+  start commands (enforced when a project is added or its command edited).
+- An occupied port is **never freed by a silent kill** — not at project start (the UI
+  asks, with the occupant's PID/name, and the kill is only executed if the PID still
+  matches) and not at rover's own startup (fails with the occupant's identity unless
+  you pass `--takeover-port`).
+- A project's URL is only advertised — and its proxy only starts forwarding — after
+  rover has confirmed something is listening on the port; the proxy is torn down the
+  moment the tracked process exits, so it can never forward tailnet traffic to a
+  stranger process that later grabs the port.
+- Enable TLS if traffic crosses an untrusted network; rotate the secret periodically
+  (existing tokens and proxy cookies become invalid immediately).
 
 ---
 
 ## Development
 
 ```sh
-# Run tests
-go test ./... -v -count=1 -timeout 60s
+# Run tests (the launcher suite spins up real helper HTTP servers)
+go test ./... -v -count=1 -timeout 180s
 
 # Lint (requires golangci-lint)
 golangci-lint run ./...
@@ -233,13 +279,23 @@ git push origin v0.1.0
 
 1. Click **"Add Project"** in the Projects tab
 2. Select a directory from the list
-3. Select a start file (`.py`, `.sh`, `.bat`, `.js`, `.ts`, `.go`, etc.)
-4. Click **"Validate & Add"** — Rover runs the script for up to 15 seconds
-5. If an HTTP URL is detected in stdout, the project is saved to `projects_registry.json`
+3. Select a start file (`.py`, `.sh`, `.bat`, `.js`, `.ts`, `.go`, etc.) and a port
+4. Click **"Validate & Add"** — Rover launches the command (with the port passed as
+   `--port <n>`, a `{port}` placeholder substitution, **and** the `PORT` env var) and
+   **probes the port until something actually listens** (TCP connect, then one HTTP
+   request — any response, even a 4xx, proves it speaks HTTP). Timeout: `--validation-timeout`, default 30 s.
+5. On success the project is saved to `projects_registry.json`. On failure you get the
+   real reason: the app's exit code and an output tail, or "nothing listened on port N".
 
 The registry file is personal and git-ignored — each installation has its own.
 
-Each project in the registry includes a `proxy_enabled` field (default `true`). When enabled, Rover allocates a dedicated listener that reverse-proxies to the project's local port. **The proxy binds to the same interface Rover itself listens on** (the host portion of `--addr`), so a proxied app is never reachable from a network Rover is not — bind Rover to your Tailscale IP and the proxies follow. The proxy URL (`http://<rover-ip>:<proxy-port>/`) is shown in the dashboard next to the running project. This allows apps bound to `127.0.0.1` to be accessed from your own devices over Tailscale/VPN without any app-level configuration.
+The same probe runs on **every start**: the status pill only turns *Running* once the
+listener is confirmed (until then it is *Starting*), a crash shows *Failed (exit N)*,
+and if the registered port is occupied you choose between **Adopt** (attach to the
+process already serving there), **Kill & start** (executed only after you confirm the
+exact PID), or a one-off alternative port.
+
+Each project in the registry includes a `proxy_enabled` field (default `true`). When enabled, Rover allocates a dedicated listener that reverse-proxies to the project's local port. **The proxy binds to the same interface Rover itself listens on** (the host portion of `--addr`), so a proxied app is never reachable from a network Rover is not — bind Rover to your Tailscale IP and the proxies follow. The proxy port is **allocated once and persisted** (`proxy_port` in the registry), so the proxy URL survives restarts and can be bookmarked on your phone. The proxy only forwards while the tracked process is alive, and can require the rover login (`--proxy-auth`). The proxy URL is shown in the dashboard next to the running project, with the hostname rewritten to whatever host your browser used to reach rover — so the link works from the tailnet, the LAN, or localhost alike.
 
 **Supported extensions:** `.py` `.sh` `.bat` `.ps1` `.js` `.ts` `.go` `.rb` `.php` `.pl` `.lua`
 
@@ -260,7 +316,10 @@ A: Use `--allow "git,go test,npm"`. Rover will reject any command that doesn't s
 A: Only with TLS + a strong secret + a firewall or VPN. Read [SECURITY.md](SECURITY.md) first.
 
 **Q: What happens to running projects when Rover shuts down?**  
-A: On **graceful shutdown** (Ctrl+C), Rover kills all child processes via `taskkill /F /T` (Windows) or `kill -9` (Unix). On **forced kill** (`SIGKILL`, `Stop-Process -Force`, taskkill without `/T`), child processes become orphans — always use graceful shutdown when possible.
+A: On **graceful shutdown** (Ctrl+C), Rover kills all child processes via `taskkill /F /T` (Windows) or `kill -9` (Unix); adopted projects are detached, not killed. On **forced kill** (`SIGKILL`, `Stop-Process -Force`, taskkill without `/T`), child processes become orphans — always use graceful shutdown when possible. An orphaned server can be re-attached after restart via **Adopt**.
+
+**Q: The project's port is already in use — what happens?**  
+A: Rover never kills the occupant silently. It identifies the listener (PID, process name, command line) and the UI offers three explicit choices: **Adopt** it (attach rover's tracking and proxy to the running process), **Kill & start** (the kill only executes if the PID you confirmed still holds the port), or a one-off alternative port.
 
 **Q: Can I run interactive commands (REPLs, editors, password prompts)?**  
 A: No — and rover **blocks them by default** with an HTTP `422` and a reason, since they'd just hang (no stdin/TTY). Use non-interactive forms (e.g. `git commit -m`, `npm init -y`). To override the guard entirely, start rover with `--no-command-guard`.

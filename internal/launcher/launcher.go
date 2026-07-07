@@ -22,17 +22,42 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/ylnhari/rover/internal/auth"
 )
 
 // ErrPortInUse is returned by Start when the requested port is already taken by
 // another process, so callers can prompt for a one-off alternative port.
 var ErrPortInUse = errors.New("port already in use")
 
+// PortConflictError reports that the target port is occupied and, when it could
+// be identified, by whom. Rover never kills the occupant on its own: callers
+// must resolve the conflict explicitly (adopt, confirmed kill, or another port).
+type PortConflictError struct {
+	Port     int
+	Occupant *Occupant
+}
+
+func (e *PortConflictError) Error() string {
+	if e.Occupant != nil {
+		return fmt.Sprintf("port %d is in use by %s", e.Port, e.Occupant)
+	}
+	return fmt.Sprintf("port %d is in use (could not identify the listener)", e.Port)
+}
+
+// Is makes errors.Is(err, ErrPortInUse) work for conflict errors.
+func (e *PortConflictError) Is(target error) bool { return target == ErrPortInUse }
+
+// portFlagRe matches a standalone --port flag (not e.g. --portfolio-mode).
+var portFlagRe = regexp.MustCompile(`(^|\s)--port(=|\s|$)`)
+
 // composeStartCmd injects the chosen port into a project's start command.
 // A "{port}" placeholder is substituted; otherwise, if the command doesn't
-// already mention --port, "--port <port>" is appended. With no port (<=0) the
-// command is returned unchanged.
+// already pass --port, "--port <port>" is appended. With no port (<=0) the
+// command is returned unchanged. The port is also always exported as the PORT
+// environment variable at launch, which most frameworks honor.
 func composeStartCmd(startCmd string, port int) string {
 	if port <= 0 {
 		return startCmd
@@ -40,7 +65,7 @@ func composeStartCmd(startCmd string, port int) string {
 	if strings.Contains(startCmd, "{port}") {
 		return strings.ReplaceAll(startCmd, "{port}", strconv.Itoa(port))
 	}
-	if strings.Contains(startCmd, "--port") {
+	if portFlagRe.MatchString(startCmd) {
 		return startCmd
 	}
 	return fmt.Sprintf("%s --port %d", startCmd, port)
@@ -64,6 +89,10 @@ type ProjectInfo struct {
 	URL          string `json:"url,omitempty"`
 	Description  string `json:"description,omitempty"`
 	ProxyEnabled bool   `json:"proxy_enabled"`
+	// ProxyPort is the stable, persisted port the reverse proxy listens on, so
+	// bookmarks survive restarts. 0 = not yet allocated (assigned on first
+	// proxied start).
+	ProxyPort int `json:"proxy_port,omitempty"`
 }
 
 type StreamEvent struct {
@@ -71,38 +100,124 @@ type StreamEvent struct {
 	Data string `json:"data,omitempty"`
 }
 
+// Project lifecycle states as reported in RunningProject.State.
+const (
+	StateStarting = "starting" // process launched, listener not yet confirmed
+	StateRunning  = "running"  // confirmed listening on its port
+	StateAdopted  = "adopted"  // pre-existing process adopted (not launched by rover)
+)
+
 type RunningProject struct {
-	Name      string    `json:"name"`
-	StartTime time.Time `json:"start_time"`
-	Port      int       `json:"port,omitempty"`
-	URL       string    `json:"url,omitempty"`
-	ProxyPort int       `json:"proxy_port,omitempty"`
-	ProxyURL  string    `json:"proxy_url,omitempty"`
+	Name       string    `json:"name"`
+	StartTime  time.Time `json:"start_time"`
+	Port       int       `json:"port,omitempty"`
+	URL        string    `json:"url,omitempty"`
+	ProxyPort  int       `json:"proxy_port,omitempty"`
+	ProxyURL   string    `json:"proxy_url,omitempty"`
+	ProxyError string    `json:"proxy_error,omitempty"`
+	State      string    `json:"state,omitempty"`
+	PID        int       `json:"pid,omitempty"`
 }
 
+// ExitStatus records how a project's last run ended.
+type ExitStatus struct {
+	Code    int       `json:"code"`
+	Time    time.Time `json:"time"`
+	Stopped bool      `json:"stopped"` // true when rover stopped it deliberately
+}
+
+// maxConsoleBuffer bounds the in-memory console history kept per project so a
+// chatty server can't grow rover's memory without limit.
+const maxConsoleBuffer = 512 * 1024
+
 type runningProcess struct {
-	info        RunningProject
-	cmd         *exec.Cmd
-	output      bytes.Buffer
-	outputMu    sync.Mutex
-	subs        []chan StreamEvent
-	subsMu      sync.Mutex
-	done        chan struct{}
-	cancel      context.CancelFunc
-	proxyServer *http.Server
-	proxyLn     net.Listener
+	// outputMu guards both output and info (mutated by the scanner, the
+	// readiness probe, and the proxy starter).
+	info          RunningProject
+	cmd           *exec.Cmd // nil for adopted processes
+	output        bytes.Buffer
+	outputMu      sync.Mutex
+	subs          []chan StreamEvent
+	subsMu        sync.Mutex
+	done          chan struct{}
+	cancel        context.CancelFunc
+	proxyServer   *http.Server
+	proxyLn       net.Listener
+	exited        atomic.Bool
+	stopRequested atomic.Bool
+}
+
+func (rp *runningProcess) broadcast(ev StreamEvent) {
+	rp.subsMu.Lock()
+	for _, ch := range rp.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+	rp.subsMu.Unlock()
+}
+
+// shutdownProxy stops the reverse proxy if one is running. Safe to call from
+// Stop and the reaper concurrently with the async proxy starter (proxy fields
+// are guarded by outputMu).
+func (rp *runningProcess) shutdownProxy() {
+	rp.outputMu.Lock()
+	srv, ln := rp.proxyServer, rp.proxyLn
+	rp.proxyServer, rp.proxyLn = nil, nil
+	rp.outputMu.Unlock()
+	if srv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		srv.Shutdown(ctx)
+		cancel()
+	}
+	if ln != nil {
+		ln.Close()
+	}
+}
+
+// appendOutput appends to the bounded console buffer, trimming the oldest
+// lines once it exceeds maxConsoleBuffer. Caller must hold outputMu.
+func (rp *runningProcess) appendOutput(s string) {
+	rp.output.WriteString(s)
+	if rp.output.Len() <= maxConsoleBuffer {
+		return
+	}
+	b := rp.output.Bytes()
+	keep := b[len(b)-maxConsoleBuffer*3/4:]
+	if i := bytes.IndexByte(keep, '\n'); i >= 0 && i+1 < len(keep) {
+		keep = keep[i+1:]
+	}
+	var nb bytes.Buffer
+	nb.WriteString("[rover] older console output truncated\n")
+	nb.Write(keep)
+	rp.output = nb
 }
 
 type Manager struct {
 	projectsRoot string
 	registryPath string
 	procs        map[string]*runningProcess
+	lastExits    map[string]ExitStatus
 	mu           sync.Mutex
-	logf         func(string, ...any)
+	// regMu serializes registry read-modify-write cycles: HTTP handlers and
+	// the async proxy starter (persistProxyPort) mutate the file concurrently.
+	regMu sync.Mutex
+	logf  func(string, ...any)
 	// bindHost is the interface rover itself listens on. Project proxies bind
 	// to the same host so a proxy is never reachable from a network rover is
 	// not. Empty means all interfaces (0.0.0.0).
 	bindHost string
+	// probeTimeout bounds how long registration validation and start-time
+	// readiness probes wait for the project to begin listening.
+	probeTimeout time.Duration
+	// Proxy auth gate: when proxyAuthOn, proxy requests must carry a valid
+	// signed rover cookie; unauthenticated browsers are redirected to rover's
+	// UI (roverScheme://host:roverPort) to log in.
+	proxyAuthOn bool
+	proxySecret string
+	roverPort   string
+	roverTLS    bool
 }
 
 type FileInfo struct {
@@ -166,7 +281,9 @@ func NewManager(projectsRoot string) *Manager {
 		projectsRoot: projectsRoot,
 		registryPath: defaultRegistryPath(),
 		procs:        make(map[string]*runningProcess),
+		lastExits:    make(map[string]ExitStatus),
 		logf:         log.Printf,
+		probeTimeout: 30 * time.Second,
 	}
 }
 
@@ -180,11 +297,33 @@ func (m *Manager) SetBindHost(host string) {
 	m.bindHost = host
 }
 
-func startProxy(bindHost string, targetPort int) (net.Listener, *http.Server, int, error) {
+// SetProbeTimeout configures how long validation / readiness probes wait for a
+// project to start listening.
+func (m *Manager) SetProbeTimeout(d time.Duration) {
+	if d > 0 {
+		m.probeTimeout = d
+	}
+}
+
+// SetProxyAuth configures the proxy authentication gate. When on, every proxy
+// request must carry a valid signed rover cookie; browsers without one are
+// redirected to rover's own UI (reached at roverPort on the same host) to log
+// in, which sets the cookie for the whole host.
+func (m *Manager) SetProxyAuth(on bool, secret, roverPort string, roverTLS bool) {
+	m.proxyAuthOn = on && secret != ""
+	m.proxySecret = secret
+	m.roverPort = roverPort
+	m.roverTLS = roverTLS
+}
+
+// startProxy binds a reverse proxy for rp on the requested port (0 = ephemeral)
+// on rover's own interface. Requests are gated on the tracked process still
+// being alive — the proxy never forwards to a port whose owner has exited —
+// and, when proxy auth is on, on a valid signed rover cookie.
+func (m *Manager) startProxy(rp *runningProcess, targetPort, proxyPort int) (net.Listener, *http.Server, int, error) {
 	// Bind the proxy to the same interface rover listens on so it is never
-	// reachable from a network rover itself is not exposed to. An empty
-	// bindHost preserves the historical all-interfaces behaviour.
-	ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, "0"))
+	// reachable from a network rover itself is not exposed to.
+	ln, err := net.Listen("tcp", net.JoinHostPort(m.bindHost, strconv.Itoa(proxyPort)))
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -192,7 +331,33 @@ func startProxy(bindHost string, targetPort int) (net.Listener, *http.Server, in
 
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", targetPort))
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	srv := &http.Server{Handler: proxy}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rp.exited.Load() {
+			http.Error(w, "project is not running", http.StatusServiceUnavailable)
+			return
+		}
+		if m.proxyAuthOn {
+			c, err := r.Cookie("rover_proxy")
+			if err != nil || auth.VerifyToken(m.proxySecret, c.Value) != nil {
+				host := r.Host
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				scheme := "http"
+				if m.roverTLS {
+					scheme = "https"
+				}
+				next := "http://" + r.Host + r.URL.RequestURI()
+				dest := fmt.Sprintf("%s://%s/?next=%s", scheme, net.JoinHostPort(host, m.roverPort), url.QueryEscape(next))
+				http.Redirect(w, r, dest, http.StatusFound)
+				return
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
+	srv := &http.Server{Handler: handler}
 
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -201,6 +366,54 @@ func startProxy(bindHost string, targetPort int) (net.Listener, *http.Server, in
 	}()
 
 	return ln, srv, pport, nil
+}
+
+// startProxyFor starts the reverse proxy for a tracked project, preferring the
+// project's stable persisted proxy port. On failure it falls back to an
+// ephemeral port (and persists the new one); if that fails too, the error is
+// recorded on the running info so the UI can surface it.
+func (m *Manager) startProxyFor(name string, rp *runningProcess, proj ProjectInfo) {
+	rp.outputMu.Lock()
+	targetPort := rp.info.Port
+	rp.outputMu.Unlock()
+	ln, srv, pport, err := m.startProxy(rp, targetPort, proj.ProxyPort)
+	if err != nil && proj.ProxyPort > 0 {
+		m.logf("launcher: proxy for %s: stable port %d unavailable (%v), falling back to an ephemeral port", name, proj.ProxyPort, err)
+		ln, srv, pport, err = m.startProxy(rp, rp.info.Port, 0)
+	}
+	if err != nil {
+		m.logf("launcher: proxy for %s: %v", name, err)
+		rp.outputMu.Lock()
+		rp.info.ProxyError = fmt.Sprintf("proxy failed to start: %v", err)
+		rp.outputMu.Unlock()
+		return
+	}
+	rp.outputMu.Lock()
+	rp.proxyLn = ln
+	rp.proxyServer = srv
+	rp.info.ProxyPort = pport
+	rp.info.ProxyURL = fmt.Sprintf("http://%s:%d", proxyURLHost(m.bindHost), pport)
+	proxyURL := rp.info.ProxyURL
+	rp.outputMu.Unlock()
+	if pport != proj.ProxyPort {
+		if err := m.persistProxyPort(name, pport); err != nil {
+			m.logf("launcher: could not persist proxy port for %s: %v", name, err)
+		}
+	}
+	rp.broadcast(StreamEvent{Type: "proxy", Data: proxyURL})
+}
+
+func (m *Manager) persistProxyPort(name string, port int) error {
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
+	reg := loadRoverRegistry(m.registryPath)
+	p, ok := reg.Projects[name]
+	if !ok {
+		return fmt.Errorf("project %q not found", name)
+	}
+	p.ProxyPort = port
+	reg.Projects[name] = p
+	return saveRoverRegistry(m.registryPath, reg)
 }
 
 func (m *Manager) ProjectsRoot() string {
@@ -223,11 +436,22 @@ func (m *Manager) Scan() []ProjectInfo {
 	return result
 }
 
-// Start launches a project. portOverride (>0) overrides the registered default
-// port for this run only; 0 uses the project's registered port. If a port is
-// known it is supplied to the server via composeStartCmd and is checked for
-// availability first — Start returns ErrPortInUse if it is already taken.
-func (m *Manager) Start(name string, portOverride int) error {
+// StartOptions controls a single project start.
+type StartOptions struct {
+	// PortOverride (>0) overrides the registered default port for this run only.
+	PortOverride int
+	// KillOccupant authorizes killing the process currently listening on the
+	// target port — but only when its PID matches ConfirmPID, which the caller
+	// must have obtained from a prior PortConflictError. This is the only path
+	// by which rover ever kills a process it did not start.
+	KillOccupant bool
+	ConfirmPID   int
+}
+
+// Start launches a project. If the target port is occupied it never kills the
+// occupant silently: it returns a *PortConflictError identifying the listener,
+// unless the caller explicitly confirmed the kill via StartOptions.
+func (m *Manager) Start(name string, opts StartOptions) error {
 	m.mu.Lock()
 	if _, ok := m.procs[name]; ok {
 		m.mu.Unlock()
@@ -235,51 +459,32 @@ func (m *Manager) Start(name string, portOverride int) error {
 	}
 	m.mu.Unlock()
 
-	projects := m.Scan()
-	var proj ProjectInfo
-	found := false
-	for _, p := range projects {
-		if p.Name == name {
-			proj = p
-			found = true
-			break
-		}
-	}
-	if !found {
+	proj := m.GetProject(name)
+	if proj == nil {
 		return fmt.Errorf("project %q not found", name)
 	}
 
 	port := proj.Port
-	if portOverride > 0 {
-		port = portOverride
+	if opts.PortOverride > 0 {
+		port = opts.PortOverride
 	}
 	if port > 0 && !portAvailable(port) {
-		// Port is in use. If we don't track any running process for this name,
-		// it may be an orphan from a previous Rover session — kill it.
-		m.mu.Lock()
-		_, tracked := m.procs[name]
-		m.mu.Unlock()
-		if !tracked {
-			m.logf("port %d is occupied by an untracked process; attempting to free it", port)
-			if err := killProcessOnPort(port); err != nil {
-				m.logf("failed to free port %d: %v", port, err)
-				return fmt.Errorf("%w: %d", ErrPortInUse, port)
+		occ := FindListenerOnPort(port)
+		if opts.KillOccupant && occ != nil && opts.ConfirmPID == occ.PID {
+			if err := KillConfirmedListener(port, occ.PID); err != nil {
+				m.logf("launcher: confirmed kill of pid %d on port %d failed: %v", occ.PID, port, err)
+				return &PortConflictError{Port: port, Occupant: occ}
 			}
-			m.logf("freed port %d", port)
-			// Re-check
-			if !portAvailable(port) {
-				return fmt.Errorf("%w: %d", ErrPortInUse, port)
+			m.logf("launcher: killed pid %d (%s) on port %d — confirmed by user", occ.PID, occ.Name, port)
+			if !waitPortFree(port, 2*time.Second) {
+				return &PortConflictError{Port: port, Occupant: FindListenerOnPort(port)}
 			}
 		} else {
-			return fmt.Errorf("%w: %d", ErrPortInUse, port)
+			return &PortConflictError{Port: port, Occupant: occ}
 		}
 	}
 
 	startCmd := composeStartCmd(proj.StartCmd, port)
-	url := proj.URL
-	if url == "" && port > 0 {
-		url = fmt.Sprintf("http://127.0.0.1:%d", port)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -303,6 +508,9 @@ func (m *Manager) Start(name string, portOverride int) error {
 		"PYTHONIOENCODING=utf-8",
 		"PYTHONLEGACYWINDOWSSTDIO=utf-8",
 	)
+	if port > 0 {
+		cmd.Env = append(cmd.Env, "PORT="+strconv.Itoa(port))
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -325,7 +533,8 @@ func (m *Manager) Start(name string, portOverride int) error {
 			Name:      name,
 			StartTime: time.Now(),
 			Port:      port,
-			URL:       url,
+			State:     StateStarting,
+			PID:       cmd.Process.Pid,
 		},
 		cmd:    cmd,
 		done:   make(chan struct{}),
@@ -333,24 +542,109 @@ func (m *Manager) Start(name string, portOverride int) error {
 	}
 
 	m.mu.Lock()
+	if _, ok := m.procs[name]; ok {
+		// A concurrent Start won the race between the top-of-function check
+		// and here; kill the process we just spawned instead of leaking it.
+		m.mu.Unlock()
+		killProcess(cmd)
+		cancel()
+		return fmt.Errorf("already running")
+	}
 	m.procs[name] = rp
+	delete(m.lastExits, name)
 	m.mu.Unlock()
 
 	go rp.captureOutput(stdout, stderr)
-
-	if proj.ProxyEnabled {
-		proxyLn, proxySrv, pport, err := startProxy(m.bindHost, port)
-		if err != nil {
-			m.logf("launcher: proxy for %s: %v", name, err)
-		} else {
-			rp.proxyLn = proxyLn
-			rp.proxyServer = proxySrv
-			rp.info.ProxyPort = pport
-			rp.info.ProxyURL = fmt.Sprintf("http://%s:%d", proxyURLHost(m.bindHost), pport)
-		}
-	}
+	go m.reap(name, rp)
+	go m.confirmStarted(name, rp, *proj, port)
 
 	return nil
+}
+
+// confirmStarted probes the project's port until something is listening, then
+// promotes the project to running, advertises its URL, and starts the reverse
+// proxy. The URL is never advertised — and the proxy never forwards — before
+// the listener is confirmed.
+func (m *Manager) confirmStarted(name string, rp *runningProcess, proj ProjectInfo, port int) {
+	if port <= 0 {
+		// No port to probe; treat the project as running once launched.
+		rp.outputMu.Lock()
+		rp.info.State = StateRunning
+		rp.outputMu.Unlock()
+		rp.broadcast(StreamEvent{Type: "ready"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), m.probeTimeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-rp.done: // process exited; stop probing
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	res := probeServer(ctx, port)
+	if !res.Listening {
+		if rp.exited.Load() {
+			return // reaper reports the failure
+		}
+		msg := fmt.Sprintf("[rover] warning: nothing is listening on port %d after %s — the app may use a different port or still be booting\n", port, m.probeTimeout)
+		m.logf("launcher: %s: nothing listening on port %d after %s", name, port, m.probeTimeout)
+		rp.outputMu.Lock()
+		rp.appendOutput(msg)
+		rp.outputMu.Unlock()
+		rp.broadcast(StreamEvent{Type: "stderr", Data: msg})
+		return
+	}
+
+	rp.outputMu.Lock()
+	rp.info.State = StateRunning
+	if rp.info.URL == "" {
+		rp.info.URL = fmt.Sprintf("http://127.0.0.1:%d", port)
+	}
+	url := rp.info.URL
+	rp.outputMu.Unlock()
+	rp.broadcast(StreamEvent{Type: "ready", Data: url})
+
+	if proj.ProxyEnabled {
+		m.startProxyFor(name, rp, proj)
+	}
+}
+
+// reap waits for the child to exit, collects its exit status (preventing
+// zombies), removes it from the running set, tears down its proxy, and tells
+// stream subscribers how the run ended.
+func (m *Manager) reap(name string, rp *runningProcess) {
+	<-rp.done // output scanners finished (pipes closed = process exited)
+
+	code := 0
+	if err := rp.cmd.Wait(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		} else {
+			code = -1
+		}
+	}
+	rp.exited.Store(true)
+	stopped := rp.stopRequested.Load()
+
+	rp.shutdownProxy()
+
+	m.mu.Lock()
+	if cur, ok := m.procs[name]; ok && cur == rp {
+		delete(m.procs, name)
+	}
+	m.lastExits[name] = ExitStatus{Code: code, Time: time.Now(), Stopped: stopped}
+	m.mu.Unlock()
+
+	if !stopped {
+		m.logf("launcher: %s exited with code %d", name, code)
+	}
+	rp.broadcast(StreamEvent{Type: "exit", Data: strconv.Itoa(code)})
+	rp.broadcast(StreamEvent{Type: "done"})
 }
 
 func (m *Manager) Stop(name string) error {
@@ -363,14 +657,21 @@ func (m *Manager) Stop(name string) error {
 	delete(m.procs, name)
 	m.mu.Unlock()
 
+	rp.stopRequested.Store(true)
+
 	// Shutdown proxy listener first
-	if rp.proxyServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		rp.proxyServer.Shutdown(ctx)
-	}
-	if rp.proxyLn != nil {
-		rp.proxyLn.Close()
+	rp.shutdownProxy()
+
+	if rp.cmd == nil {
+		// Adopted process: detach only — rover does not own it, so it is left
+		// running. The user can kill it via the confirmed-kill start flow.
+		rp.exited.Store(true)
+		m.mu.Lock()
+		m.lastExits[name] = ExitStatus{Time: time.Now(), Stopped: true}
+		m.mu.Unlock()
+		rp.broadcast(StreamEvent{Type: "done"})
+		m.logf("launcher: detached from adopted process for %s (process left running)", name)
+		return nil
 	}
 
 	err := killProcess(rp.cmd)
@@ -398,25 +699,116 @@ func (m *Manager) StopAll() {
 	}
 }
 
+// Adopt attaches rover to a process that is already listening on the project's
+// registered port (e.g. the same app started by hand, or an orphan from a
+// previous rover run): it verifies something is listening, tracks it as
+// running, and starts the reverse proxy for it. Stop on an adopted project
+// detaches without killing.
+func (m *Manager) Adopt(name string) (*RunningProject, error) {
+	m.mu.Lock()
+	if _, ok := m.procs[name]; ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("already running")
+	}
+	m.mu.Unlock()
+
+	proj := m.GetProject(name)
+	if proj == nil {
+		return nil, fmt.Errorf("project %q not found", name)
+	}
+	if proj.Port <= 0 {
+		return nil, fmt.Errorf("project %q has no registered port to adopt", name)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	res := probeServer(ctx, proj.Port)
+	if !res.Listening {
+		return nil, fmt.Errorf("nothing is listening on port %d", proj.Port)
+	}
+
+	occ := FindListenerOnPort(proj.Port)
+	pid := 0
+	desc := "unknown process"
+	if occ != nil {
+		pid = occ.PID
+		desc = occ.String()
+	}
+
+	rp := &runningProcess{
+		info: RunningProject{
+			Name:      name,
+			StartTime: time.Now(),
+			Port:      proj.Port,
+			URL:       fmt.Sprintf("http://127.0.0.1:%d", proj.Port),
+			State:     StateAdopted,
+			PID:       pid,
+		},
+		done: make(chan struct{}),
+	}
+	rp.appendOutput(fmt.Sprintf("[rover] adopted %s listening on port %d (not started by rover; Stop detaches without killing)\n", desc, proj.Port))
+
+	m.mu.Lock()
+	if _, ok := m.procs[name]; ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("already running")
+	}
+	m.procs[name] = rp
+	delete(m.lastExits, name)
+	m.mu.Unlock()
+
+	m.logf("launcher: adopted %s on port %d for project %s", desc, proj.Port, name)
+
+	if proj.ProxyEnabled {
+		m.startProxyFor(name, rp, *proj)
+	}
+
+	cp := rp.info
+	return &cp, nil
+}
+
 func (m *Manager) GetRunning(name string) *RunningProject {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	rp, ok := m.procs[name]
+	m.mu.Unlock()
 	if !ok {
 		return nil
 	}
+	rp.outputMu.Lock()
 	cp := rp.info
+	rp.outputMu.Unlock()
 	return &cp
 }
 
 func (m *Manager) ListRunning() []RunningProject {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	list := make([]RunningProject, 0, len(m.procs))
+	procs := make([]*runningProcess, 0, len(m.procs))
 	for _, rp := range m.procs {
+		procs = append(procs, rp)
+	}
+	m.mu.Unlock()
+	list := make([]RunningProject, 0, len(procs))
+	for _, rp := range procs {
+		rp.outputMu.Lock()
 		list = append(list, rp.info)
+		rp.outputMu.Unlock()
 	}
 	return list
+}
+
+// LastExit reports how the project's most recent run ended, or nil if it never
+// ran (or is currently running).
+func (m *Manager) LastExit(name string) *ExitStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, running := m.procs[name]; running {
+		return nil
+	}
+	if ex, ok := m.lastExits[name]; ok {
+		cp := ex
+		return &cp
+	}
+	return nil
 }
 
 func (m *Manager) Subscribe(name string) (chan StreamEvent, error) {
@@ -469,7 +861,6 @@ func (m *Manager) Unsubscribe(name string, ch chan StreamEvent) {
 func (rp *runningProcess) captureOutput(stdout, stderr io.Reader) {
 	defer close(rp.done)
 
-	urlRe := regexp.MustCompile(`https?://\S+`)
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -482,39 +873,32 @@ func (rp *runningProcess) captureOutput(stdout, stderr io.Reader) {
 			out := line + "\n"
 
 			rp.outputMu.Lock()
-			rp.output.WriteString(out)
+			rp.appendOutput(out)
 			rp.outputMu.Unlock()
 
-			ev := StreamEvent{Type: kind, Data: out}
-			rp.subsMu.Lock()
-			for _, ch := range rp.subs {
-				select {
-				case ch <- ev:
-				default:
-				}
-			}
-			rp.subsMu.Unlock()
+			rp.broadcast(StreamEvent{Type: kind, Data: out})
 
-			if m := urlRe.FindString(line); m != "" {
-				url := strings.TrimRight(m, ".,;:!?)}>]\"'`")
-				url = replaceLoopback(url)
+			if match := probeURLRe.FindString(line); match != "" {
+				u := strings.TrimRight(match, ".,;:!?)}>]\"'`")
+				u = replaceLoopback(u)
 				rp.outputMu.Lock()
-				rp.info.URL = url
-				if idx := strings.LastIndex(url, ":"); idx > 0 {
-					if p, err := strconv.Atoi(url[idx+1:]); err == nil {
-						rp.info.Port = p
+				// The readiness probe is authoritative for the URL; a scraped
+				// URL only fills the gap when nothing is known yet (it is a
+				// log line, not a verified listener).
+				set := false
+				if rp.info.URL == "" {
+					rp.info.URL = u
+					set = true
+					if parsed, err := url.Parse(u); err == nil && parsed.Port() != "" {
+						if p, err := strconv.Atoi(parsed.Port()); err == nil && rp.info.Port == 0 {
+							rp.info.Port = p
+						}
 					}
 				}
 				rp.outputMu.Unlock()
-				ev := StreamEvent{Type: "url", Data: url}
-				rp.subsMu.Lock()
-				for _, ch := range rp.subs {
-					select {
-					case ch <- ev:
-					default:
-					}
+				if set {
+					rp.broadcast(StreamEvent{Type: "url", Data: u})
 				}
-				rp.subsMu.Unlock()
 			}
 		}
 	}
@@ -522,16 +906,6 @@ func (rp *runningProcess) captureOutput(stdout, stderr io.Reader) {
 	go scan(stdout, "stdout")
 	go scan(stderr, "stderr")
 	wg.Wait()
-
-	ev := StreamEvent{Type: "done"}
-	rp.subsMu.Lock()
-	for _, ch := range rp.subs {
-		select {
-		case ch <- ev:
-		default:
-		}
-	}
-	rp.subsMu.Unlock()
 }
 
 func detectStartCmd(relPath string) string {
@@ -637,108 +1011,38 @@ func (m *Manager) ListEligibleFiles(dir string) []FileInfo {
 	return files
 }
 
-func (m *Manager) ValidateProject(dir, startCmd string) (int, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	var shell, flag string
-	if runtime.GOOS == "windows" {
-		shell, flag = "cmd", "/C"
-	} else {
-		shell, flag = "sh", "-c"
-	}
-
-	cmd := exec.CommandContext(ctx, shell, flag, startCmd)
-	cmd.Dir = dir
-	setProcessGroup(cmd)
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
-	cmd.Env = append(cmd.Env,
-		"PYTHONUNBUFFERED=1",
-		"PYTHONIOENCODING=utf-8",
-		"PYTHONLEGACYWINDOWSSTDIO=utf-8",
-	)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return 0, "", fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return 0, "", fmt.Errorf("stderr pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return 0, "", fmt.Errorf("start: %w", err)
-	}
-	defer killChildProcesses(cmd)
-
-	urlRe := regexp.MustCompile(`https?://\S+`)
-	urlCh := make(chan string, 1)
-
-	scan := func(r io.Reader) {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			line := sc.Text()
-			if m := urlRe.FindString(line); m != "" {
-				url := strings.TrimRight(m, ".,;:!?)}>]\"'`")
-				url = replaceLoopback(url)
-				select {
-				case urlCh <- url:
-				default:
-				}
-			}
-		}
-	}
-
-	go scan(stdout)
-	go scan(stderr)
-
-	select {
-	case url := <-urlCh:
-		cancel()
-		port := 0
-		if idx := strings.LastIndex(url, ":"); idx > 0 {
-			if p, err := strconv.Atoi(url[idx+1:]); err == nil {
-				port = p
-			}
-		}
-		return port, url, nil
-	case <-ctx.Done():
-		return 0, "", fmt.Errorf("validation timed out: no URL detected in 15 seconds")
-	}
-}
+// projectNameRe constrains project names to safe path components: no
+// separators, no leading dot, max 64 chars.
+var projectNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // AddProject registers a project at a user-supplied port. The raw startCmd is
-// stored without the port; rover supplies it at launch via composeStartCmd, so
-// the port can be changed later without rewriting the command. The project is
-// validated by briefly launching it (on the given port) and confirming it
-// prints a URL.
-func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, error) {
-	if port <= 0 {
-		return nil, fmt.Errorf("a port is required")
+// stored without the port; rover supplies it at launch (via composeStartCmd and
+// the PORT env var), so the port can be changed later without rewriting the
+// command. The project is validated by launching it and probing the port until
+// something actually listens (see ValidateProject); the returned
+// ValidationReport is non-nil whenever validation ran, on success and failure
+// alike.
+func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, *ValidationReport, error) {
+	if !projectNameRe.MatchString(name) {
+		return nil, nil, fmt.Errorf("invalid project name %q: use letters, digits, dot, dash or underscore (no path separators, no leading dot)", name)
+	}
+	if port < 1024 || port > 65535 {
+		return nil, nil, fmt.Errorf("port must be in 1024-65535")
 	}
 	dir := filepath.Join(m.projectsRoot, name)
-
-	reg := loadRoverRegistry(m.registryPath)
-	if reg.Projects == nil {
-		reg.Projects = make(map[string]ProjectInfo)
-	}
-	if _, ok := reg.Projects[name]; ok {
-		return nil, fmt.Errorf("project %q already exists in rover registry", name)
-	}
-	for _, p := range reg.Projects {
-		if p.Port == port {
-			return nil, fmt.Errorf("port %d is already assigned to project %q", port, p.Name)
-		}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return nil, nil, fmt.Errorf("project directory %q not found under projects root", name)
 	}
 
-	_, url, err := m.ValidateProject(dir, composeStartCmd(startCmd, port))
+	if err := m.checkRegistrable(name, port); err != nil {
+		return nil, nil, err
+	}
+
+	report, err := m.ValidateProject(dir, composeStartCmd(startCmd, port), port)
 	if err != nil {
-		return nil, err
+		return nil, report, err
 	}
+	url := report.DetectedURL
 	if url == "" {
 		url = fmt.Sprintf("http://127.0.0.1:%d", port)
 	}
@@ -749,15 +1053,36 @@ func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, err
 		Port:         port,
 		StartCmd:     startCmd,
 		URL:          url,
-		Description:  "Active",
 		ProxyEnabled: true,
 	}
-	reg.Projects[name] = p
 
-	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
-		return nil, err
+	// Validation ran unlocked (it can take up to the probe timeout), so
+	// re-check uniqueness under the registry lock before committing.
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
+	if err := m.checkRegistrable(name, port); err != nil {
+		return nil, report, err
 	}
-	return &p, nil
+	reg := loadRoverRegistry(m.registryPath)
+	reg.Projects[name] = p
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		return nil, report, err
+	}
+	return &p, report, nil
+}
+
+// checkRegistrable reports whether name/port are free in the registry.
+func (m *Manager) checkRegistrable(name string, port int) error {
+	reg := loadRoverRegistry(m.registryPath)
+	if _, ok := reg.Projects[name]; ok {
+		return fmt.Errorf("project %q already exists in rover registry", name)
+	}
+	for _, p := range reg.Projects {
+		if p.Port == port {
+			return fmt.Errorf("port %d is already assigned to project %q", port, p.Name)
+		}
+	}
+	return nil
 }
 
 // UpdateProjectPort changes a project's registered default port.
@@ -765,6 +1090,8 @@ func (m *Manager) UpdateProjectPort(name string, port int) (*ProjectInfo, error)
 	if port <= 0 {
 		return nil, fmt.Errorf("port must be greater than 0")
 	}
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
 	reg := loadRoverRegistry(m.registryPath)
 	p, ok := reg.Projects[name]
 	if !ok {
@@ -789,6 +1116,8 @@ func (m *Manager) UpdateProjectCommand(name, startCmd string) (*ProjectInfo, err
 	if startCmd == "" {
 		return nil, fmt.Errorf("start command must not be empty")
 	}
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
 	reg := loadRoverRegistry(m.registryPath)
 	p, ok := reg.Projects[name]
 	if !ok {
@@ -815,6 +1144,8 @@ func (m *Manager) GetProject(name string) *ProjectInfo {
 
 // SetProxyEnabled updates the proxy_enabled flag for a project in the registry.
 func (m *Manager) SetProxyEnabled(name string, enabled bool) (*ProjectInfo, error) {
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
 	reg := loadRoverRegistry(m.registryPath)
 	p, ok := reg.Projects[name]
 	if !ok {
@@ -829,6 +1160,8 @@ func (m *Manager) SetProxyEnabled(name string, enabled bool) (*ProjectInfo, erro
 }
 
 func (m *Manager) RemoveProject(name string) error {
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
 	reg := loadRoverRegistry(m.registryPath)
 	if _, ok := reg.Projects[name]; !ok {
 		return fmt.Errorf("project %q not found", name)
@@ -882,6 +1215,8 @@ func loadRoverRegistry(path string) roverRegistry {
 	return reg
 }
 
+// saveRoverRegistry writes the registry atomically (temp file + rename) with
+// owner-only permissions, so a crash mid-write can't tear the file.
 func saveRoverRegistry(path string, reg roverRegistry) error {
 	if path == "" {
 		return fmt.Errorf("registry path not set")
@@ -890,7 +1225,11 @@ func saveRoverRegistry(path string, reg roverRegistry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func killProcess(cmd *exec.Cmd) error {
@@ -900,53 +1239,14 @@ func killProcess(cmd *exec.Cmd) error {
 	return killChildProcesses(cmd)
 }
 
-// killProcessOnPort finds and kills any process listening on the given TCP port.
-func killProcessOnPort(port int) error {
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command("netstat", "-ano")
-		out, err := cmd.Output()
-		if err != nil {
-			return fmt.Errorf("netstat failed: %w", err)
+// waitPortFree polls until the port is bindable or the timeout elapses.
+func waitPortFree(port int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if portAvailable(port) {
+			return true
 		}
-		lines := strings.Split(string(out), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.Contains(line, "LISTENING") && strings.Contains(line, ":"+strconv.Itoa(port)+" ") {
-				fields := strings.Fields(line)
-				if len(fields) > 4 {
-					pid := strings.TrimSpace(fields[len(fields)-1])
-					if pid == "" || pid == strconv.Itoa(os.Getpid()) {
-						continue
-					}
-					kill := exec.Command("taskkill", "/F", "/PID", pid)
-					if err := kill.Run(); err != nil {
-						return fmt.Errorf("failed to kill PID %s: %w", pid, err)
-					}
-					return nil
-				}
-			}
-		}
-		return fmt.Errorf("no process found listening on port %d", port)
+		time.Sleep(100 * time.Millisecond)
 	}
-	// Unix: use lsof to find the PID, then kill it.
-	cmd := exec.Command("sh", "-c", fmt.Sprintf("lsof -ti :%d", port))
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("no process found on port %d: %w", port, err)
-	}
-	pids := strings.Fields(string(out))
-	if len(pids) == 0 {
-		return fmt.Errorf("no process found on port %d", port)
-	}
-	for _, pid := range pids {
-		pid = strings.TrimSpace(pid)
-		if pid == "" || pid == strconv.Itoa(os.Getpid()) {
-			continue
-		}
-		kill := exec.Command("kill", "-9", pid)
-		if err := kill.Run(); err != nil {
-			return fmt.Errorf("failed to kill PID %s: %w", pid, err)
-		}
-	}
-	return nil
+	return portAvailable(port)
 }

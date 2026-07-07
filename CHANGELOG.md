@@ -10,6 +10,28 @@ Rover uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Security
+- **No more silent kills on occupied ports.** Starting a project on a busy port used to
+  `kill -9` whatever held it (matching even mere clients via `lsof` without a LISTEN
+  filter); rover's own startup did the same to its port. Both now identify the
+  *listening* process (PID, name, command line) and refuse: project start returns
+  `409` with the occupant so the UI can offer **Adopt / confirmed Kill / another port**
+  (the kill is executed only if the confirmed PID still holds the port and is never
+  rover itself); rover startup fails with the occupant named unless `--takeover-port`.
+- **Proxy auth (`--proxy-auth auto|on|off`).** Project reverse proxies — previously
+  always unauthenticated — can now require the rover login via a signed HttpOnly
+  cookie (set at login; unauthenticated browsers are redirected to rover to log in
+  once per 24 h). `auto` (default) keeps proxies open on loopback and Tailscale
+  (100.64.0.0/10) binds, where the network layer is the auth boundary, and turns the
+  gate on for LAN/all-interfaces binds; rover warns loudly when proxies are exposed
+  unauthenticated off-tailnet.
+- **Proxies stop forwarding when the app dies.** The proxy is torn down on child exit
+  and refuses requests for a dead target, so it can never forward traffic to a
+  stranger process that later grabs the port.
+- **`--allow` and the command guard now cover project start commands** (enforced at
+  registration and when a command is edited), not just `/api/exec`.
+- **Project name validation** in `AddProject` (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, no
+  path separators) closes a path-traversal hole in the launch working directory; the
+  registry is now written atomically with `0600` permissions.
 - **Secret is now required unless bound to loopback.** Rover previously ran in an
   unauthenticated "secret-less mode" while still binding all interfaces; it now refuses
   to start without `--secret`/`$ROVER_SECRET` unless `--addr` is a loopback host. This
@@ -19,11 +41,30 @@ Rover uses [Semantic Versioning](https://semver.org/).
   bind Rover to your Tailscale IP and the proxies are private to your tailnet.
 
 ### Changed
+- **Real server validation.** Registering a project no longer greps stdout for a URL
+  for 15 s: rover launches the command and probes the port (TCP connect until it
+  listens, then one HTTP request) with a configurable `--validation-timeout`
+  (default 30 s). Failures report the app's exit code and an output tail. The same
+  probe runs at every start: the UI shows *Starting* until the listener is confirmed,
+  the URL is only advertised after confirmation, and the proxy starts only then.
+- **Truthful lifecycle.** Launched children are reaped (`Wait`) on exit — no more
+  zombies; exit codes are recorded and exposed (`last_exit` in `/api/projects`, an
+  `exit` SSE event); a crashed project shows **Failed (exit N)** instead of a
+  permanent stale *Running*.
+- **Stable proxy ports.** Each project's proxy port is allocated once, persisted in
+  the registry (`proxy_port`), and reused on every start, so phone bookmarks survive
+  restarts. Proxy start failures are surfaced on the project card instead of being
+  logged silently.
+- Project URLs shown in the UI use the host the browser actually reached rover on
+  (instead of guessing a LAN IP); the port is injected as `--port`/`{port}` **and**
+  the standard `PORT` env var, and a `--portfolio`-style flag no longer suppresses
+  injection.
+- Project console history is now a bounded buffer (512 KB with truncation marker).
 - **Web UI redesign.** Refreshed the whole dark theme — cohesive palette, depth,
   type hierarchy, a centered reading column for the Terminal, status pills / chips for
   projects, a real empty state, and toast notifications. All native browser dialogs
   (`alert` / `prompt` / `confirm`) are replaced with in-app toasts and modals
-  (Edit Port, Edit Command, Remove-project confirm, port-in-use override). No new
+  (Edit Port, Edit Command, Remove-project confirm, port-conflict resolution). No new
   dependencies or build step; still a single embedded document.
 - **Terminal history restores command output after a reload.** The lightweight
   `/api/sessions` list omits stdout/stderr; the UI now lazily fetches each completed
@@ -31,11 +72,17 @@ Rover uses [Semantic Versioning](https://semver.org/).
 - **Projects now use an explicit, registered port instead of self-discovery.** When
   adding a project you supply the port; rover stores it and passes it to the app at
   launch as `--port <port>` (or substitutes a `{port}` placeholder in the start command).
-- Starting a project **fails fast if its port is already in use** rather than launching
-  blindly; the web UI then prompts for a one-off alternate port for that start only,
-  leaving the registered default unchanged.
 
 ### Added
+- **Adopt** (`POST /api/projects/{name}/adopt`): attach rover's tracking and reverse
+  proxy to a process already listening on the project's port (started manually or
+  orphaned by a previous rover run). Stop on an adopted project detaches without
+  killing.
+- `GET /api/proxy-cookie` to mint the proxy-auth cookie for the current browser;
+  `?next=` login redirect flow from gated proxies back to the app.
+- `DELETE /api/sessions` and a confirm dialog on "clear history": deletes saved
+  command history from disk, leaving running sessions untouched.
+- `docs/PRODUCTION_AUDIT.md`: the audit that drove all of the above.
 - **Command guard (on by default):** the Terminal tab now rejects commands that cannot
   work in rover's fresh, non-interactive, host-side shell — interactive editors/REPLs/
   pagers, password prompts, GUI/file/browser launchers, `git commit` without `-m`,
