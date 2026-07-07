@@ -31,6 +31,8 @@ Open [http://localhost:2278](http://localhost:2278) and log in with your secret.
 ### Project Launcher
 - **Start/stop projects** from the browser — Python scripts, Node servers, Go programs, etc.
 - **Real server validation** — registration and every start probe the port (TCP connect, then an HTTP request) until the app actually listens; the URL is only advertised once confirmed
+- **Truthful, viewer-aware links** — a URL renders as a clickable link only when it will work *from where you're looking*: the proxy link everywhere, a direct link only after rover dialed the app's socket and got a connection, and loopback addresses clickable only in a browser on the rover host itself (informational text on other devices). See [Dashboard links](#dashboard-links--which-url-opens-what-from-where)
+- **Web / TCP / task project kinds** — HTTP servers get links + proxy; a raw TCP listener gets an honest "TCP · no proxy" chip instead of a proxy link that could only fail; port-less workers/scripts get console-only cards. See [Project kinds](#project-kinds-web-tcp-task)
 - **Honest lifecycle** — children are reaped on exit (no zombies); a crash shows **Failed (exit N)**, never a stale "Running"
 - **Safe port conflicts** — an occupied port is never freed by a silent kill: rover identifies the listener (PID, name, cmdline) and offers **Adopt** / confirmed **Kill & start** / another port
 - **Adopt running servers** — attach rover (tracking + proxy) to an app already listening on the project's port, e.g. one you started by hand
@@ -156,8 +158,8 @@ All protected endpoints require the `X-Rover-Secret: <token>` header, where `<to
 | GET | `/api/sessions/{id}/stream` | ✓ | SSE real-time output stream |
 | GET | `/api/config` | ✓ | Get exec timeout and max output |
 | PUT | `/api/config` | ✓ | Update exec timeout and max output |
-| GET | `/api/projects` | ✓ | List registered projects |
-| POST | `/api/projects` | ✓ | Add a project (validates by starting it) |
+| GET | `/api/projects` | ✓ | List registered projects. Per running project: `running_url` (app-reported, informational), `direct_url` (present only when socket-verified reachable on rover's interface), `proxy_url`, `kind` (`web`/`tcp`/`task`). The response carries an `X-Rover-Local-Viewer: 1\|0` header telling the client whether this request came from the rover host itself |
+| POST | `/api/projects` | ✓ | Add a project (validates by starting it). `port: 0` or omitted registers a port-less **task** |
 | DELETE | `/api/projects/{name}` | ✓ | Remove a project from the registry |
 | GET | `/api/projects/dirs` | ✓ | List available unregistered directories |
 | GET | `/api/projects/{name}/files` | ✓ | List eligible start files in a directory |
@@ -243,6 +245,9 @@ proxied project listens on its own port. Two mechanisms cover that gap:
   rover has confirmed something is listening on the port; the proxy is torn down the
   moment the tracked process exits, so it can never forward tailnet traffic to a
   stranger process that later grabs the port.
+- A **direct** (non-proxy) link is advertised only after rover verified the app's
+  socket on its own interface by dialing it — and **never while `--proxy-auth` is
+  on**: the UI will not present an unauthenticated path around a gate you enabled.
 - Enable TLS if traffic crosses an untrusted network; rotate the secret periodically
   (existing tokens and proxy cookies become invalid immediately).
 
@@ -279,11 +284,16 @@ git push origin v0.1.0
 
 1. Click **"Add Project"** in the Projects tab
 2. Select a directory from the list
-3. Select a start file (`.py`, `.sh`, `.bat`, `.js`, `.ts`, `.go`, etc.) and a port
+3. Select a start file (`.py`, `.sh`, `.bat`, `.js`, `.ts`, `.go`, etc.) and a port —
+   or **leave the port empty** to register a port-less **task** (a worker or script
+   with no web UI; see [Project kinds](#project-kinds-web-tcp-task))
 4. Click **"Validate & Add"** — Rover launches the command (with the port passed as
    `--port <n>`, a `{port}` placeholder substitution, **and** the `PORT` env var) and
    **probes the port until something actually listens** (TCP connect, then one HTTP
-   request — any response, even a 4xx, proves it speaks HTTP). Timeout: `--validation-timeout`, default 30 s.
+   request — any response, even a 4xx, proves it speaks HTTP; a listener that never
+   answers HTTP is classified `tcp`). Timeout: `--validation-timeout`, default 30 s.
+   Port-less tasks are instead given a short grace run and fail registration only if
+   they die non-zero right away.
 5. On success the project is saved to `projects_registry.json`. On failure you get the
    real reason: the app's exit code and an output tail, or "nothing listened on port N".
 
@@ -298,6 +308,63 @@ exact PID), or a one-off alternative port.
 Each project in the registry includes a `proxy_enabled` field (default `true`). When enabled, Rover allocates a dedicated listener that reverse-proxies to the project's local port. **The proxy binds to the same interface Rover itself listens on** (the host portion of `--addr`), so a proxied app is never reachable from a network Rover is not — bind Rover to your Tailscale IP and the proxies follow. The proxy port is **allocated once and persisted** (`proxy_port` in the registry), so the proxy URL survives restarts and can be bookmarked on your phone. The proxy only forwards while the tracked process is alive, and can require the rover login (`--proxy-auth`). The proxy URL is shown in the dashboard next to the running project, with the hostname rewritten to whatever host your browser used to reach rover — so the link works from the tailnet, the LAN, or localhost alike.
 
 **Supported extensions:** `.py` `.sh` `.bat` `.ps1` `.js` `.ts` `.go` `.rb` `.php` `.pl` `.lua`
+
+---
+
+## Dashboard links — which URL opens what, from where
+
+Every link in rover's UI is a **verified claim, never a guess**. A running project
+card can show up to three address elements:
+
+| Element | Looks like | When it appears | Where it works |
+|---|---|---|---|
+| **Proxy link** | ⎐ `http://<rover-host>:<proxy-port>` (green) | project is proxy-enabled and speaks HTTP | **anywhere rover itself is reachable** — phone, laptop, any device. This is the link to bookmark on your phone. |
+| **Direct link** | ↗ `http://<rover-host>:<app-port>` (blue) | only after rover **dialed the app's socket on its own interface and got a connection** — i.e. the app genuinely binds `0.0.0.0` or rover's interface, not just loopback. Never shown while `--proxy-auth` is on (it would silently bypass the login gate). | any device that can reach rover's interface |
+| **Local address** | ⌂ `http://127.0.0.1:<port>` | the app binds (or reports) loopback only | **clickable only when your browser runs on the rover host itself.** On any other device it renders as inert grey text marked *(host only)* — tapping it there would hit *that device's own* loopback and fail. |
+
+**How rover tells the host apart from your phone:** not by the URL — the host
+machine and a phone may both open the dashboard via the same address (e.g. a
+VPN/tailnet IP). Rover checks the **TCP source address of each request**: a browser
+on the host connects from the machine's own IP or loopback, every other device
+connects from its own address. (`X-Forwarded-For` is honored only on loopback
+connections — for setups like `tailscale serve` — so a remote client can't spoof
+host status.)
+
+Clickable proxy/direct links are additionally rewritten to the hostname **your
+browser used to reach rover**, so the same link works from localhost, the LAN, or a
+tailnet without per-network configuration.
+
+**Which link should you click?**
+
+- **Phone / any remote device** → the green **proxy** link.
+- **Browser on the rover host** → the ⌂ **local** link is the shortest path (browser
+  → app directly, no proxy hop); the proxy link works there too.
+- **Performance:** the proxy adds one same-machine loopback hop — well under a
+  millisecond, with streamed bodies and WebSocket/SSE support. Real-world latency is
+  dominated by your network path, not the proxy.
+
+---
+
+## Project kinds: web, tcp, task
+
+The validation probe classifies every project, and both the UI and the proxy adapt:
+
+| Kind | How it's detected | What you get |
+|---|---|---|
+| `web` | listens on its port **and answers an HTTP request** (any status code counts) | status pill, links, reverse proxy |
+| `tcp` | listens on its port but never answers HTTP (a database, a game server, a custom protocol) | a **"TCP · no proxy"** chip instead of a proxy link — rover's reverse proxy is HTTP-only and could only return errors for it |
+| `task` | registered **without a port** (leave the port field empty) | a console-only card: start/stop, live log streaming, exit status. No URL chrome at all. |
+
+Details worth knowing:
+
+- `web` is **sticky**: one failed HTTP check during a slow boot does not take the
+  proxy down for a project that already proved it speaks HTTP. If a `tcp` project
+  later answers HTTP, it is upgraded to `web` and the registry updated.
+- Projects registered **before kinds existed** (no `kind` field in the registry)
+  keep the old behavior — always proxied — so upgrading rover changes nothing for
+  an existing installation.
+- Two port-less tasks never conflict with each other; port uniqueness is only
+  enforced between real ports.
 
 ---
 
@@ -329,3 +396,18 @@ A: Every command runs in a fresh shell. Combine them in one command with `&&`, e
 
 **Q: I ran a command that opens a browser/app and nothing appeared in my browser.**  
 A: It opened on the machine running rover, not on your device — GUI launches aren't useful over rover. See [How commands run](#how-commands-run-and-their-limits).
+
+**Q: Which project link should I open — there are two?**  
+A: On a phone or any remote device, the green **⎐ proxy** link (bookmarkable — its port is stable across restarts). In a browser on the rover host itself, the **⌂ local** link opens the app directly with no proxy hop; the proxy link works there too. See [Dashboard links](#dashboard-links--which-url-opens-what-from-where).
+
+**Q: Why is the app's `127.0.0.1` address grey text instead of a link on my phone?**  
+A: Because it would not work there: `127.0.0.1` on your phone is the phone itself. Rover shows it as information and makes it clickable only for browsers it verified are running on the rover host (by the request's TCP source address). Use the proxy link from other devices.
+
+**Q: Does the reverse proxy slow my apps down?**  
+A: Not noticeably. The extra hop is a same-machine loopback forward (sub-millisecond); bodies are streamed, and SSE/WebSockets pass through. Your Wi-Fi/VPN latency dwarfs it. On the rover host you can skip it entirely via the local link.
+
+**Q: Can I register something that isn't a web server — a worker, a script?**  
+A: Yes — leave the port field empty when adding it. It becomes a **task**: rover starts/stops it and streams its console, with no port probing and no links. See [Project kinds](#project-kinds-web-tcp-task).
+
+**Q: My app listens on a port but rover shows "TCP · no proxy".**  
+A: The validation probe connected to the port but got no HTTP response, so the app was classified `tcp` (e.g. a database or custom protocol). Rover's reverse proxy is HTTP-only, so it honestly declines to offer a proxy link. If the app actually is an HTTP server that was just slow to answer during validation, start it once more — the moment a start-time probe sees HTTP it is upgraded to `web` permanently.

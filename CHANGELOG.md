@@ -10,6 +10,15 @@ Rover uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Security
+- **The direct link is now a verified fact, and never an auth bypass.** The blue
+  "direct" project link used to be inferred from the app's log banner (with loopback
+  hostnames rewritten to a guessed local IP) or fall back to a raw `127.0.0.1` URL —
+  misleading or dead for remote viewers. Rover now *dials the app's socket on its own
+  interface* after the readiness probe and only advertises `direct_url` when the
+  connection succeeds; scraped banner URLs are kept verbatim as information. While
+  `--proxy-auth` is on, no direct link is ever advertised (it would silently bypass
+  the login gate the operator enabled).
+
 - **No more silent kills on occupied ports.** Starting a project on a busy port used to
   `kill -9` whatever held it (matching even mere clients via `lsof` without a LISTEN
   filter); rover's own startup did the same to its port. Both now identify the
@@ -73,7 +82,30 @@ Rover uses [Semantic Versioning](https://semver.org/).
   adding a project you supply the port; rover stores it and passes it to the app at
   launch as `--port <port>` (or substitutes a `{port}` placeholder in the start command).
 
+### Fixed
+- Registry saves retry the atomic rename briefly: on Windows a virus scanner
+  holding a just-written file could make back-to-back saves (kind, then proxy port)
+  silently drop an update.
+
 ### Added
+- **Viewer-aware local links.** The dashboard knows whether *your* browser runs on
+  the rover host (decided per request from the TCP source address vs the machine's
+  own interfaces; `X-Forwarded-For` honored only from loopback so it can't be
+  spoofed): on the host, a loopback-only app's `⌂ 127.0.0.1:<port>` renders
+  clickable; on a phone or another machine the same address renders as inert
+  "(host only)" text instead of a dead link. Exposed as the `X-Rover-Local-Viewer`
+  header on `GET /api/projects`.
+- **Project kinds (`web` / `tcp` / `task`).** The validation probe's HTTP
+  classification is persisted as `kind`: HTTP servers behave as before; a listener
+  that never answers HTTP is `tcp` and gets a "TCP · no proxy" chip instead of a
+  proxy link that could only fail (rover's proxy is HTTP-only); `web` is sticky so
+  one failed HTTP check during a slow boot doesn't take the proxy down, and upgrades
+  are persisted. Registry entries from before kinds existed keep the old
+  always-proxy behavior.
+- **Port-less task projects.** Leaving the port empty when adding a project
+  registers a worker/script: validated by a short grace run (registration fails only
+  on an immediate non-zero exit), console-only card, no port probing, no proxy, and
+  no port-uniqueness conflicts between tasks.
 - **Adopt** (`POST /api/projects/{name}/adopt`): attach rover's tracking and reverse
   proxy to a process already listening on the project's port (started manually or
   orphaned by a previous rover run). Stop on an adopted project detaches without
