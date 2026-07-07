@@ -140,6 +140,7 @@ type runningProcess struct {
 	subs          []chan StreamEvent
 	subsMu        sync.Mutex
 	done          chan struct{}
+	reaped        chan struct{} // closed by reap() after the exit is recorded
 	cancel        context.CancelFunc
 	proxyServer   *http.Server
 	proxyLn       net.Listener
@@ -538,6 +539,7 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		},
 		cmd:    cmd,
 		done:   make(chan struct{}),
+		reaped: make(chan struct{}),
 		cancel: cancel,
 	}
 
@@ -617,6 +619,7 @@ func (m *Manager) confirmStarted(name string, rp *runningProcess, proj ProjectIn
 // zombies), removes it from the running set, tears down its proxy, and tells
 // stream subscribers how the run ended.
 func (m *Manager) reap(name string, rp *runningProcess) {
+	defer close(rp.reaped)
 	<-rp.done // output scanners finished (pipes closed = process exited)
 
 	code := 0
@@ -676,8 +679,10 @@ func (m *Manager) Stop(name string) error {
 
 	err := killProcess(rp.cmd)
 	rp.cancel()
+	// Wait for the reaper, not just the pipes: when Stop returns, the exit is
+	// recorded (LastExit) and the process table is consistent.
 	select {
-	case <-rp.done:
+	case <-rp.reaped:
 	case <-time.After(5 * time.Second):
 	}
 	return err
