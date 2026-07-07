@@ -850,15 +850,62 @@ func (s *Server) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// requestFromHostMachine reports whether the request originates from the rover
+// host itself (browser on the same machine) rather than a remote device. The
+// TCP source address is the ground truth: a same-machine connection arrives
+// from loopback or from one of this machine's own interface addresses, while a
+// phone or another computer arrives from its own address. When a local front
+// (e.g. tailscale serve) forwards from loopback, the real client is taken from
+// X-Forwarded-For — which is only trusted for loopback connections, so a remote
+// client cannot spoof it.
+func requestFromHostMachine(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		xff := r.Header.Get("X-Forwarded-For")
+		if xff == "" {
+			return true
+		}
+		fwd := net.ParseIP(strings.TrimSpace(strings.Split(xff, ",")[0]))
+		if fwd == nil {
+			return false
+		}
+		ip = fwd
+		if ip.IsLoopback() {
+			return true
+		}
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	projects := s.launcher.Scan()
 	running := s.launcher.ListRunning()
 
 	type projectView struct {
 		launcher.ProjectInfo
-		IsRunning  bool                 `json:"is_running"`
-		State      string               `json:"state,omitempty"`
+		IsRunning bool   `json:"is_running"`
+		State     string `json:"state,omitempty"`
+		// URL is the app-reported address (unverified, may be loopback-only);
+		// DirectURL is present only when rover verified the socket is reachable
+		// on its own advertised interface.
 		URL        string               `json:"running_url,omitempty"`
+		DirectURL  string               `json:"direct_url,omitempty"`
 		StartedAt  string               `json:"started_at,omitempty"`
 		ProxyURL   string               `json:"proxy_url,omitempty"`
 		ProxyError string               `json:"proxy_error,omitempty"`
@@ -877,6 +924,7 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 			v.IsRunning = true
 			v.State = rp.State
 			v.URL = rp.URL
+			v.DirectURL = rp.DirectURL
 			if rp.Port > 0 {
 				v.Port = rp.Port
 			}
@@ -892,6 +940,15 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		views = append(views, v)
 	}
 
+	// Tell the UI whether this viewer is on the rover host itself, so it can
+	// decide client-side if a loopback URL is clickable for THIS viewer. The
+	// hostname the browser used is not enough: the host laptop and a phone may
+	// both reach rover via the same non-loopback bind address.
+	local := "0"
+	if requestFromHostMachine(r) {
+		local = "1"
+	}
+	w.Header().Set("X-Rover-Local-Viewer", local)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(views)
 }
@@ -1023,8 +1080,10 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "name and start_cmd are required", http.StatusBadRequest)
 		return
 	}
-	if body.Port <= 0 {
-		jsonError(w, "a valid port is required", http.StatusBadRequest)
+	// Port 0 registers a port-less task (worker/script); anything else must be
+	// a real user port (range-checked again by the launcher).
+	if body.Port < 0 || body.Port > 65535 {
+		jsonError(w, "port must be 1024-65535, or omitted for a port-less task", http.StatusBadRequest)
 		return
 	}
 	if !s.commandPermitted(w, r, body.StartCmd) {
@@ -1050,6 +1109,7 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		"port":          p.Port,
 		"start_cmd":     p.StartCmd,
 		"url":           p.URL,
+		"kind":          p.Kind,
 		"proxy_enabled": p.ProxyEnabled,
 		"report":        report,
 	})
@@ -1490,6 +1550,8 @@ background:rgba(255,255,255,.035);border:1px solid var(--border);border-radius:6
 background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.22);border-radius:6px;padding:3px 9px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .project-url:hover{background:rgba(96,165,250,.18)}
 .project-url.proxy{color:#7ee2a4;background:var(--green-soft);border-color:rgba(34,197,94,.24)}
+.project-url.local{color:var(--text-dim);background:rgba(255,255,255,.035);border-color:var(--border);cursor:default}
+.project-url.local:hover{background:rgba(255,255,255,.035)}
 .project-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .project-actions .btn{padding:6px 12px;font-size:11.5px}
 .project-actions .spacer{flex:1}
@@ -1634,8 +1696,8 @@ header{padding:9px 11px;gap:8px}header h1{font-size:14px}
 </div>
 <div class="modal-field">
 <label>Port</label>
-<input type="number" id="addPort" min="1" max="65535" placeholder="e.g. 8770">
-<div class="field-note">Rover passes this to the app as --port.</div>
+<input type="number" id="addPort" min="1024" max="65535" placeholder="e.g. 8770 — leave empty for a task">
+<div class="field-note">Rover passes this to the app as --port. Leave empty to register a port-less task (worker/script): rover runs it and shows its console, no web UI.</div>
 </div>
 <div id="addProjectStatus"></div>
 </div>
@@ -2114,10 +2176,17 @@ loadProjects();
 // ── Projects ──────────────────────────────────────────
 refreshBtn.addEventListener('click',loadProjects);
 
+// True when THIS browser runs on the rover host machine itself (laptop with
+// rover, not a phone/other device reaching the same address). Decided by the
+// server from the request's source address; the hostname in the URL bar can be
+// identical for both, so it is only a fallback signal.
+let viewerOnHost=location.hostname==='localhost'||location.hostname==='127.0.0.1';
+
 async function loadProjects(){
 try{
 const r=await fetch('/api/projects',{headers:{'X-Rover-Secret':getToken()}});
 if(!r.ok)return;
+if(r.headers.get('X-Rover-Local-Viewer')==='1')viewerOnHost=true;
 const projects=await r.json();
 renderProjects(projects);
 }catch(e){
@@ -2135,10 +2204,12 @@ for(const p of projects){
 const status=determineStatus(p);
 const dotCls=status==='running'?'running':status==='starting'?'starting':status==='failed'?'failed':'stopped';
 const statusLabel=statusLabelFor(p,status);
-const urlHtml=p.running_url?'<a href="'+esc(p.running_url)+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(p.running_url)+'</a>':'';
+const urlHtml=p.direct_url?directUrlHtml(p.direct_url):(p.is_running&&p.running_url?localUrlHtml(p.running_url):'');
 const proxyHref=p.proxy_url?displayUrl(p.proxy_url):'';
 const proxyUrlHtml=proxyHref?'<a href="'+esc(proxyHref)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(proxyHref)+'</a>':'';
 const proxyErrHtml=p.proxy_error?'<span class="meta-chip" style="color:#e5484d" title="'+esc(p.proxy_error)+'">⚠ proxy failed</span>':'';
+const isTask=p.kind==='task';
+const kindChip=isTask?'<span class="meta-chip" title="Port-less task: rover runs it and shows its console; there is no web UI to open.">task</span>':(p.kind==='tcp'?'<span class="meta-chip" title="The app listens but did not answer HTTP, so rover cannot proxy it. Reach it directly on its port.">TCP · no proxy</span>':'');
 const proxyLabel=p.proxy_enabled?'Proxy ON':'Proxy OFF';
 const proxyBtnCls=p.proxy_enabled?'btn-proxy-on':'btn-proxy-off';
 html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
@@ -2148,7 +2219,8 @@ html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
 '<button class="btn-remove" data-project="'+esc(p.name)+'" title="Remove project">✕</button>'+
 '</div>'+
 '<div class="project-meta">'+
-'<span class="meta-chip">Port <b>'+(p.port||'—')+'</b></span>'+
+(isTask?'':'<span class="meta-chip">Port <b>'+(p.port||'—')+'</b></span>')+
+kindChip+
 '<span id="url-'+esc(p.name)+'">'+urlHtml+'</span>'+
 (proxyUrlHtml?'<span id="proxyurl-'+esc(p.name)+'">'+proxyUrlHtml+'</span>':'')+
 proxyErrHtml+
@@ -2158,9 +2230,9 @@ proxyErrHtml+
 '<button class="btn btn-danger btn-stop" id="stop-'+esc(p.name)+'" data-project="'+esc(p.name)+'" '+(status==='running'||status==='starting'?'':'disabled')+'>Stop</button>'+
 '<button class="btn btn-ghost btn-log" id="log-'+esc(p.name)+'" data-project="'+esc(p.name)+'">Log</button>'+
 '<span class="spacer"></span>'+
-'<button class="btn btn-ghost btn-port" id="port-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-port="'+(p.port||'')+'">Port</button>'+
+(isTask?'':'<button class="btn btn-ghost btn-port" id="port-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-port="'+(p.port||'')+'">Port</button>')+
 '<button class="btn btn-ghost btn-cmd" id="cmd-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-cmd="'+esc(p.start_cmd)+'">Cmd</button>'+
-'<button class="btn '+proxyBtnCls+'" id="proxy-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-enabled="'+p.proxy_enabled+'">'+proxyLabel+'</button>'+
+(isTask?'':'<button class="btn '+proxyBtnCls+'" id="proxy-'+esc(p.name)+'" data-project="'+esc(p.name)+'" data-enabled="'+p.proxy_enabled+'">'+proxyLabel+'</button>')+
 '</div>'+
 (p.description?'<div class="project-desc">'+esc(p.description)+'</div>':'')+
 '<div class="project-start-cmd">'+esc(p.start_cmd)+'</div>'+
@@ -2211,6 +2283,20 @@ return'Stopped';
 // link works from wherever you are (tailnet, LAN, localhost).
 function displayUrl(u){
 try{const p=new URL(u);p.hostname=location.hostname;return p.toString();}catch(e){return u;}
+}
+// Clickable direct link: only for direct_url, which the server verified by
+// dialing the app's socket on rover's own interface.
+function directUrlHtml(u){
+const href=displayUrl(u);
+return '<a href="'+esc(href)+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(href)+'</a>';
+}
+// App-reported address (usually loopback), NOT verified reachable off the
+// rover host. For a viewer ON the host it works and renders clickable; for a
+// remote viewer (phone, another machine) it would hit their own loopback, so
+// it renders as plain informational text — never a dead link.
+function localUrlHtml(u){
+if(viewerOnHost)return '<a href="'+esc(u)+'" target="_blank" rel="noopener" class="project-url" title="Loopback address — this browser is on the rover host, so it opens directly.">⌂ '+esc(u)+'</a>';
+return '<span class="project-url local" title="Address the app reports; only reachable on the rover host itself. Use the proxy link from other devices.">⌂ '+esc(u)+' (host only)</span>';
 }
 
 function setPill(name,cls,label){
@@ -2340,17 +2426,21 @@ if(d.type==='stdout'||d.type==='stderr'){
 outputEl.textContent+=d.data;
 outputEl.scrollTop=outputEl.scrollHeight;
 }else if(d.type==='url'){
+// App-reported address (scraped or loopback fallback) — informational only;
+// a verified direct link arrives via the ready event, never here.
 const urlEl=$('url-'+name);
-if(urlEl)urlEl.innerHTML='<a href="'+esc(d.data)+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(d.data)+'</a>';
+if(urlEl&&!urlEl.querySelector('a'))urlEl.innerHTML=localUrlHtml(d.data);
 if(outputEl){
 outputEl.innerHTML+='<div class="url-line">'+esc(d.data)+'</div>';
 }
 }else if(d.type==='ready'){
-// Listener confirmed on the port: NOW it is truthfully running.
+// Listener confirmed on the port: NOW it is truthfully running. Data is
+// the direct URL only when rover verified the socket on its own
+// interface; empty means loopback-only, so keep the informational text.
 setPill(name,'running','Running');
 if(d.data){
 const urlEl=$('url-'+name);
-if(urlEl)urlEl.innerHTML='<a href="'+esc(d.data)+'" target="_blank" rel="noopener" class="project-url">↗ '+esc(d.data)+'</a>';
+if(urlEl)urlEl.innerHTML=directUrlHtml(d.data);
 }
 const stopBtn=$('stop-'+name);
 if(stopBtn)stopBtn.disabled=false;
@@ -2501,15 +2591,16 @@ async function validateAndAddProject(){
 if(!selectedDir||!selectedFile)return;
 const btn=$('addProjectConfirm');
 const status=$('addProjectStatus');
-const port=parseInt($('addPort').value,10);
-if(!(port>0)){
+const portRaw=$('addPort').value.trim();
+const port=portRaw===''?0:parseInt(portRaw,10);
+if(portRaw!==''&&!(port>0)){
 status.className='error';
-status.textContent='Please enter a valid port for this project.';
+status.textContent='Enter a port, or leave the field empty to register a port-less task.';
 return;
 }
 btn.disabled=true;
 status.className='loading';
-status.textContent='Starting the app and probing port '+port+' until it listens (up to 30 s)…';
+status.textContent=port>0?'Starting the app and probing port '+port+' until it listens (up to 30 s)…':'Starting the task and watching for early failures…';
 try{
 const r=await fetch('/api/projects',{
 method:'POST',
@@ -2521,16 +2612,16 @@ if(!r.ok){
 status.className='error';
 let msg='Failed: '+(data.error||'unknown error');
 const rep=data.report;
-if(rep&&rep.exit_code!==undefined&&rep.exit_code!==null)msg='Failed: the app exited with code '+rep.exit_code+' before listening on port '+port+'.';
-else if(rep&&rep.probe&&!rep.probe.listening&&rep.log_tail!==undefined)msg='Failed: nothing listened on port '+port+' within the timeout.';
+if(rep&&rep.exit_code!==undefined&&rep.exit_code!==null)msg=port>0?'Failed: the app exited with code '+rep.exit_code+' before listening on port '+port+'.':'Failed: the task exited with code '+rep.exit_code+' during validation.';
+else if(port>0&&rep&&rep.probe&&!rep.probe.listening&&rep.log_tail!==undefined)msg='Failed: nothing listened on port '+port+' within the timeout.';
 if(rep&&rep.log_tail)msg+=' Output: '+rep.log_tail.slice(-400);
 status.textContent=msg;
 btn.disabled=false;
 return;
 }
 status.className='success';
-const boot=data.report&&data.report.probe?' ('+(data.report.probe.http?'HTTP':'TCP')+' confirmed in '+data.report.probe.boot_ms+' ms)':'';
-status.textContent='Project "'+selectedDir+'" added at '+data.url+boot;
+const boot=data.report&&data.report.probe&&data.report.probe.listening?' ('+(data.report.probe.http?'HTTP':'TCP')+' confirmed in '+data.report.probe.boot_ms+' ms)':'';
+status.textContent='Project "'+selectedDir+'" added'+(data.url?' at '+data.url:' as a task')+boot;
 toast('Project "'+selectedDir+'" added','ok');
 setTimeout(()=>{
 closeAddProjectModal();

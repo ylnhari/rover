@@ -312,14 +312,8 @@ func TestCreateAndGetSession(t *testing.T) {
 		t.Fatal("want non-empty session ID")
 	}
 
-	time.Sleep(500 * time.Millisecond)
-
-	resp2 := getJSON(t, ts.URL+"/api/sessions/"+created.ID, token)
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("want 200, got %d", resp2.StatusCode)
-	}
-
+	// Spawning a shell can be slow when the whole suite runs in parallel, so
+	// poll for completion instead of trusting a fixed sleep.
 	var detail struct {
 		ID       string `json:"id"`
 		Command  string `json:"command"`
@@ -327,7 +321,20 @@ func TestCreateAndGetSession(t *testing.T) {
 		ExitCode int    `json:"exit_code"`
 		Stdout   string `json:"stdout"`
 	}
-	json.NewDecoder(resp2.Body).Decode(&detail)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		resp2 := getJSON(t, ts.URL+"/api/sessions/"+created.ID, token)
+		if resp2.StatusCode != http.StatusOK {
+			resp2.Body.Close()
+			t.Fatalf("want 200, got %d", resp2.StatusCode)
+		}
+		json.NewDecoder(resp2.Body).Decode(&detail)
+		resp2.Body.Close()
+		if detail.Status != "running" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if detail.ID != created.ID {
 		t.Errorf("want id=%q, got %q", created.ID, detail.ID)
 	}

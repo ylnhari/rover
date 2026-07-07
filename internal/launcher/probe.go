@@ -200,6 +200,78 @@ func (m *Manager) ValidateProject(dir, startCmd string, port int) (*ValidationRe
 	}
 }
 
+// taskValidationGrace is how long ValidateTask watches a port-less command for
+// an early failure before declaring it viable.
+const taskValidationGrace = 3 * time.Second
+
+// ValidateTask verifies a port-less project's command at least starts: it is
+// launched and watched for a short grace window. Exiting non-zero within it
+// fails registration (with the log tail); exiting 0 (a one-shot script) or
+// still running when the window closes (a long-lived worker) passes. There is
+// no port to probe, so this is the strongest check available without guessing
+// what the task is supposed to do. The launched process is always torn down.
+func (m *Manager) ValidateTask(dir, startCmd string) (*ValidationReport, error) {
+	report := &ValidationReport{}
+
+	var shell, flag string
+	if runtime.GOOS == "windows" {
+		shell, flag = "cmd", "/C"
+	} else {
+		shell, flag = "sh", "-c"
+	}
+
+	// Like ValidateProject, deliberately NOT CommandContext: killChildProcesses
+	// must take down the whole tree, not just the shell.
+	cmd := exec.Command(shell, flag, startCmd)
+	cmd.Dir = dir
+	setProcessGroup(cmd)
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = append(cmd.Env,
+		"PYTHONUNBUFFERED=1",
+		"PYTHONIOENCODING=utf-8",
+		"PYTHONLEGACYWINDOWSSTDIO=utf-8",
+	)
+
+	tail := &tailBuffer{max: 4096}
+	cmd.Stdout = tail
+	cmd.Stderr = tail
+
+	if err := cmd.Start(); err != nil {
+		return report, fmt.Errorf("start: %w", err)
+	}
+
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	select {
+	case err := <-waitCh:
+		report.LogTail = tail.String()
+		code := 0
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else {
+				code = -1
+			}
+		}
+		report.ExitCode = &code
+		if code != 0 {
+			return report, fmt.Errorf("task exited with code %d during validation (output tail: %s)", code, strings.TrimSpace(report.LogTail))
+		}
+		return report, nil
+	case <-time.After(taskValidationGrace):
+		killChildProcesses(cmd)
+		select {
+		case <-waitCh:
+		case <-time.After(5 * time.Second):
+		}
+		report.LogTail = tail.String()
+		return report, nil
+	}
+}
+
 // detectURLFromLogs returns the first URL-looking string in the output, if any.
 func detectURLFromLogs(logs string) string {
 	match := probeURLRe.FindString(logs)

@@ -81,6 +81,15 @@ func portAvailable(port int) bool {
 	return true
 }
 
+// Project kinds, classified by the validation/readiness probe. The zero value
+// (empty) means "registered before kinds existed" and is treated like web so
+// existing registries keep today's behavior.
+const (
+	KindWeb  = "web"  // listens and speaks HTTP: proxyable
+	KindTCP  = "tcp"  // listens but does not speak HTTP: rover cannot proxy it
+	KindTask = "task" // no port: a worker/script, console output is the product
+)
+
 type ProjectInfo struct {
 	Name         string `json:"name"`
 	Path         string `json:"path"`
@@ -88,6 +97,7 @@ type ProjectInfo struct {
 	StartCmd     string `json:"start_cmd"`
 	URL          string `json:"url,omitempty"`
 	Description  string `json:"description,omitempty"`
+	Kind         string `json:"kind,omitempty"`
 	ProxyEnabled bool   `json:"proxy_enabled"`
 	// ProxyPort is the stable, persisted port the reverse proxy listens on, so
 	// bookmarks survive restarts. 0 = not yet allocated (assigned on first
@@ -108,15 +118,21 @@ const (
 )
 
 type RunningProject struct {
-	Name       string    `json:"name"`
-	StartTime  time.Time `json:"start_time"`
-	Port       int       `json:"port,omitempty"`
-	URL        string    `json:"url,omitempty"`
-	ProxyPort  int       `json:"proxy_port,omitempty"`
-	ProxyURL   string    `json:"proxy_url,omitempty"`
-	ProxyError string    `json:"proxy_error,omitempty"`
-	State      string    `json:"state,omitempty"`
-	PID        int       `json:"pid,omitempty"`
+	Name      string    `json:"name"`
+	StartTime time.Time `json:"start_time"`
+	Port      int       `json:"port,omitempty"`
+	// URL is what the app itself reports (scraped banner or loopback fallback).
+	// It is informational: nothing guarantees it works off the rover host.
+	URL string `json:"url,omitempty"`
+	// DirectURL is set only after rover verified, by dialing the socket, that
+	// the app is reachable on rover's advertised interface. Empty means
+	// loopback-only (or unverified): the UI must not offer a direct link then.
+	DirectURL  string `json:"direct_url,omitempty"`
+	ProxyPort  int    `json:"proxy_port,omitempty"`
+	ProxyURL   string `json:"proxy_url,omitempty"`
+	ProxyError string `json:"proxy_error,omitempty"`
+	State      string `json:"state,omitempty"`
+	PID        int    `json:"pid,omitempty"`
 }
 
 // ExitStatus records how a project's last run ended.
@@ -232,8 +248,6 @@ var eligibleExts = map[string]bool{
 	".php": true, ".pl": true, ".lua": true,
 }
 
-var loopbackURLRe = regexp.MustCompile(`(https?://)(?:localhost|127\.0\.0\.1|0\.0\.0\.0)`)
-
 func localIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -262,12 +276,28 @@ func proxyURLHost(bindHost string) string {
 	return bindHost
 }
 
-func replaceLoopback(url string) string {
-	ip := localIP()
-	if ip == "localhost" {
-		return url
+// verifyDirectURL checks socket-level reality instead of trusting log banners:
+// it dials the project's port on rover's advertised interface and returns a
+// direct URL only when something actually accepts connections there (i.e. the
+// app bound 0.0.0.0 or that interface, not just loopback). Returns "" when the
+// app is only reachable on the rover host, when rover has no non-loopback
+// interface to advertise, or when proxy auth is on — a direct link would be a
+// silent bypass of the auth gate the operator turned on, so it is never
+// advertised alongside the authenticated proxy link.
+func (m *Manager) verifyDirectURL(port int) string {
+	if m.proxyAuthOn || port <= 0 {
+		return ""
 	}
-	return loopbackURLRe.ReplaceAllString(url, "${1}"+ip)
+	host := proxyURLHost(m.bindHost)
+	if host == "localhost" {
+		return ""
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), time.Second)
+	if err != nil {
+		return ""
+	}
+	conn.Close()
+	return fmt.Sprintf("http://%s:%d", host, port)
 }
 
 func defaultRegistryPath() string {
@@ -601,18 +631,55 @@ func (m *Manager) confirmStarted(name string, rp *runningProcess, proj ProjectIn
 		return
 	}
 
+	// Dial the port on rover's advertised interface (outside the lock) so the
+	// direct link reflects the actual socket, not a guess from log text.
+	direct := m.verifyDirectURL(port)
+
 	rp.outputMu.Lock()
 	rp.info.State = StateRunning
 	if rp.info.URL == "" {
 		rp.info.URL = fmt.Sprintf("http://127.0.0.1:%d", port)
 	}
+	rp.info.DirectURL = direct
 	url := rp.info.URL
 	rp.outputMu.Unlock()
-	rp.broadcast(StreamEvent{Type: "ready", Data: url})
+	rp.broadcast(StreamEvent{Type: "url", Data: url})
+	rp.broadcast(StreamEvent{Type: "ready", Data: direct})
 
-	if proj.ProxyEnabled {
+	if proj.ProxyEnabled && m.classifyListener(name, &proj, res.HTTP) {
 		m.startProxyFor(name, rp, proj)
 	}
+}
+
+// classifyListener reconciles the probe's HTTP classification with the
+// project's persisted kind and reports whether the listener is proxyable.
+// "web" is sticky: one failed GET at boot (an app still warming up) must not
+// take down the proxy for a project that already proved it speaks HTTP. An
+// upgrade to web is persisted so the registry converges on observed reality.
+// Only a project both classified tcp and failing the HTTP check now is not
+// proxied — the reverse proxy would just serve 502s for it. A legacy empty
+// kind stays proxyable, exactly as before kinds existed.
+func (m *Manager) classifyListener(name string, proj *ProjectInfo, isHTTP bool) bool {
+	if isHTTP && proj.Kind != KindWeb {
+		proj.Kind = KindWeb
+		if err := m.persistKind(name, KindWeb); err != nil {
+			m.logf("launcher: could not persist kind for %s: %v", name, err)
+		}
+	}
+	return isHTTP || proj.Kind != KindTCP
+}
+
+func (m *Manager) persistKind(name, kind string) error {
+	m.regMu.Lock()
+	defer m.regMu.Unlock()
+	reg := loadRoverRegistry(m.registryPath)
+	p, ok := reg.Projects[name]
+	if !ok {
+		return fmt.Errorf("project %q not found", name)
+	}
+	p.Kind = kind
+	reg.Projects[name] = p
+	return saveRoverRegistry(m.registryPath, reg)
 }
 
 // reap waits for the child to exit, collects its exit status (preventing
@@ -746,6 +813,7 @@ func (m *Manager) Adopt(name string) (*RunningProject, error) {
 			StartTime: time.Now(),
 			Port:      proj.Port,
 			URL:       fmt.Sprintf("http://127.0.0.1:%d", proj.Port),
+			DirectURL: m.verifyDirectURL(proj.Port),
 			State:     StateAdopted,
 			PID:       pid,
 		},
@@ -764,7 +832,7 @@ func (m *Manager) Adopt(name string) (*RunningProject, error) {
 
 	m.logf("launcher: adopted %s on port %d for project %s", desc, proj.Port, name)
 
-	if proj.ProxyEnabled {
+	if proj.ProxyEnabled && m.classifyListener(name, proj, res.HTTP) {
 		m.startProxyFor(name, rp, *proj)
 	}
 
@@ -885,11 +953,13 @@ func (rp *runningProcess) captureOutput(stdout, stderr io.Reader) {
 
 			if match := probeURLRe.FindString(line); match != "" {
 				u := strings.TrimRight(match, ".,;:!?)}>]\"'`")
-				u = replaceLoopback(u)
 				rp.outputMu.Lock()
 				// The readiness probe is authoritative for the URL; a scraped
-				// URL only fills the gap when nothing is known yet (it is a
-				// log line, not a verified listener).
+				// URL only fills the gap when nothing is known yet. It is kept
+				// exactly as the app printed it — it is a log line, not a
+				// verified listener, so rewriting its host would fabricate a
+				// reachability claim rover hasn't checked (DirectURL is the
+				// only field with a verified host).
 				set := false
 				if rp.info.URL == "" {
 					rp.info.URL = u
@@ -1024,15 +1094,17 @@ var projectNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 // stored without the port; rover supplies it at launch (via composeStartCmd and
 // the PORT env var), so the port can be changed later without rewriting the
 // command. The project is validated by launching it and probing the port until
-// something actually listens (see ValidateProject); the returned
-// ValidationReport is non-nil whenever validation ran, on success and failure
-// alike.
+// something actually listens (see ValidateProject), and classified web or tcp
+// by whether the listener answered HTTP. Port 0 registers a port-less task
+// (worker/script): validated only by a short grace run (see ValidateTask), no
+// URL, no proxy. The returned ValidationReport is non-nil whenever validation
+// ran, on success and failure alike.
 func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, *ValidationReport, error) {
 	if !projectNameRe.MatchString(name) {
 		return nil, nil, fmt.Errorf("invalid project name %q: use letters, digits, dot, dash or underscore (no path separators, no leading dot)", name)
 	}
-	if port < 1024 || port > 65535 {
-		return nil, nil, fmt.Errorf("port must be in 1024-65535")
+	if port != 0 && (port < 1024 || port > 65535) {
+		return nil, nil, fmt.Errorf("port must be in 1024-65535, or 0 for a port-less task")
 	}
 	dir := filepath.Join(m.projectsRoot, name)
 	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
@@ -1043,13 +1115,29 @@ func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, *Va
 		return nil, nil, err
 	}
 
-	report, err := m.ValidateProject(dir, composeStartCmd(startCmd, port), port)
+	var report *ValidationReport
+	var err error
+	var url, kind string
+	if port == 0 {
+		kind = KindTask
+		report, err = m.ValidateTask(dir, startCmd)
+	} else {
+		report, err = m.ValidateProject(dir, composeStartCmd(startCmd, port), port)
+		if report != nil && report.Probe.Listening {
+			kind = KindTCP
+			if report.Probe.HTTP {
+				kind = KindWeb
+			}
+		}
+	}
 	if err != nil {
 		return nil, report, err
 	}
-	url := report.DetectedURL
-	if url == "" {
-		url = fmt.Sprintf("http://127.0.0.1:%d", port)
+	if port > 0 {
+		url = report.DetectedURL
+		if url == "" {
+			url = fmt.Sprintf("http://127.0.0.1:%d", port)
+		}
 	}
 
 	p := ProjectInfo{
@@ -1058,7 +1146,8 @@ func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, *Va
 		Port:         port,
 		StartCmd:     startCmd,
 		URL:          url,
-		ProxyEnabled: true,
+		Kind:         kind,
+		ProxyEnabled: port > 0,
 	}
 
 	// Validation ran unlocked (it can take up to the probe timeout), so
@@ -1083,7 +1172,8 @@ func (m *Manager) checkRegistrable(name string, port int) error {
 		return fmt.Errorf("project %q already exists in rover registry", name)
 	}
 	for _, p := range reg.Projects {
-		if p.Port == port {
+		// Port-less tasks (port 0) never collide with each other.
+		if port > 0 && p.Port == port {
 			return fmt.Errorf("port %d is already assigned to project %q", port, p.Name)
 		}
 	}
@@ -1234,7 +1324,17 @@ func saveRoverRegistry(path string, reg roverRegistry) error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// On Windows the rename fails spuriously when a virus scanner or indexer
+	// briefly holds the just-written temp file or the destination (likely when
+	// two saves land back to back, e.g. kind then proxy port); retry briefly
+	// rather than dropping the update.
+	for i := 0; ; i++ {
+		err = os.Rename(tmp, path)
+		if err == nil || i >= 9 {
+			return err
+		}
+		time.Sleep(time.Duration(i+1) * 10 * time.Millisecond)
+	}
 }
 
 func killProcess(cmd *exec.Cmd) error {

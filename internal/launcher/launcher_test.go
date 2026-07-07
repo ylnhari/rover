@@ -42,6 +42,37 @@ func helperServerCmd() string {
 	return os.Args[0] + " -test.run=^TestHelperHTTPServer$ -test.skip=p{port}"
 }
 
+// TestHelperRawTCPServer accepts TCP connections but never answers, so the
+// readiness probe sees a listener that does not speak HTTP.
+func TestHelperRawTCPServer(t *testing.T) {
+	if os.Getenv("ROVER_TEST_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		t.Fatal("PORT not set")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			time.Sleep(30 * time.Second)
+			c.Close()
+		}(conn)
+	}
+}
+
+func helperRawTCPCmd() string {
+	return os.Args[0] + " -test.run=^TestHelperRawTCPServer$ -test.skip=p{port}"
+}
+
 func freeTCPPort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -470,6 +501,10 @@ func TestStartConfirmsReadyAndProxies(t *testing.T) {
 	if rp.URL != wantURL {
 		t.Errorf("URL = %q; want %q", rp.URL, wantURL)
 	}
+	// The helper binds loopback only, so no verified direct URL may appear.
+	if rp.DirectURL != "" {
+		t.Errorf("DirectURL = %q; want empty for a loopback-only app", rp.DirectURL)
+	}
 	if rp.ProxyPort <= 0 {
 		t.Fatalf("proxy did not start: %+v", rp)
 	}
@@ -784,12 +819,220 @@ func TestSetLogger(t *testing.T) {
 	}
 }
 
-func wantURL(host string, port int) string {
+func TestAddTaskProject(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+
+	os.MkdirAll(filepath.Join(dir, "worker"), 0755)
+	os.MkdirAll(filepath.Join(dir, "worker2"), 0755)
+	os.MkdirAll(filepath.Join(dir, "failer"), 0755)
+
+	// One-shot task: exits 0 during the grace window and passes validation.
+	p, report, err := m.AddProject("worker", "echo done", 0)
+	if err != nil {
+		t.Fatalf("AddProject task: %v", err)
+	}
+	if p.Kind != KindTask {
+		t.Errorf("Kind = %q; want %q", p.Kind, KindTask)
+	}
+	if p.ProxyEnabled {
+		t.Error("a port-less task must not have the proxy enabled")
+	}
+	if p.URL != "" {
+		t.Errorf("a task must not claim a URL, got %q", p.URL)
+	}
+	if p.Port != 0 {
+		t.Errorf("Port = %d; want 0", p.Port)
+	}
+	if report == nil || report.ExitCode == nil || *report.ExitCode != 0 {
+		t.Errorf("expected exit code 0 in the report, got %+v", report)
+	}
+
+	// Two port-less tasks must not collide on "port 0".
+	if _, _, err := m.AddProject("worker2", "echo hi", 0); err != nil {
+		t.Fatalf("second task must register without a port conflict: %v", err)
+	}
+
+	// A task that dies non-zero within the grace window fails registration.
+	_, report, err = m.AddProject("failer", "exit 3", 0)
+	if err == nil {
+		t.Fatal("expected error for a task exiting non-zero during validation")
+	}
+	if report == nil || report.ExitCode == nil || *report.ExitCode != 3 {
+		t.Errorf("expected exit code 3 in the report, got %+v", report)
+	}
+}
+
+func TestClassifyListener(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"p": {Name: "p", Path: dir, StartCmd: "x", Port: 1234, Kind: KindTCP},
+	}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+
+	// tcp + still no HTTP: not proxyable.
+	proj := reg.Projects["p"]
+	if m.classifyListener("p", &proj, false) {
+		t.Error("tcp listener that does not speak HTTP must not be proxied")
+	}
+
+	// tcp + HTTP now: proxyable, and the upgrade to web is persisted.
+	if !m.classifyListener("p", &proj, true) {
+		t.Error("HTTP-speaking listener must be proxied")
+	}
+	if proj.Kind != KindWeb {
+		t.Errorf("Kind = %q; want %q after observing HTTP", proj.Kind, KindWeb)
+	}
+	if saved := loadRoverRegistry(m.registryPath).Projects["p"]; saved.Kind != KindWeb {
+		t.Errorf("persisted Kind = %q; want %q", saved.Kind, KindWeb)
+	}
+
+	// web is sticky: one failed GET at boot must not take down the proxy.
+	web := ProjectInfo{Name: "p", Kind: KindWeb}
+	if !m.classifyListener("p", &web, false) {
+		t.Error("a validated web project must stay proxied despite one failed HTTP check")
+	}
+
+	// Legacy empty kind keeps pre-kind behavior: always proxied.
+	legacy := ProjectInfo{Name: "p", Kind: ""}
+	if !m.classifyListener("p", &legacy, false) {
+		t.Error("legacy project without a kind must keep its proxy")
+	}
+}
+
+func TestStartDoesNotProxyNonHTTP(t *testing.T) {
+	t.Setenv("ROVER_TEST_HELPER", "1")
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	m.SetBindHost("127.0.0.1")
+	m.SetProbeTimeout(15 * time.Second)
+
+	appDir := filepath.Join(dir, "rawtcp")
+	os.MkdirAll(appDir, 0755)
+	port := freeTCPPort(t)
+
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"rawtcp": {Name: "rawtcp", Path: appDir, StartCmd: helperRawTCPCmd(), Port: port, Kind: KindTCP, ProxyEnabled: true},
+	}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Start("rawtcp", StartOptions{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer m.Stop("rawtcp")
+
+	rp := waitForRunning(t, m, "rawtcp", 15*time.Second)
+	// Give the (synchronous, but be safe) proxy path a beat, then assert no
+	// proxy came up for a listener that cannot speak HTTP.
+	time.Sleep(300 * time.Millisecond)
+	rp = m.GetRunning("rawtcp")
+	if rp.ProxyPort != 0 || rp.ProxyURL != "" {
+		t.Errorf("no proxy expected for a tcp-classified non-HTTP listener, got port %d url %q", rp.ProxyPort, rp.ProxyURL)
+	}
+}
+
+func TestStartKeepsProxyForLegacyKind(t *testing.T) {
+	// Regression guard for registries written before kinds existed: an empty
+	// kind must keep the proxy even when the HTTP classification fails, so
+	// existing deployments lose nothing.
+	t.Setenv("ROVER_TEST_HELPER", "1")
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	m.SetBindHost("127.0.0.1")
+	m.SetProbeTimeout(15 * time.Second)
+
+	appDir := filepath.Join(dir, "legacy")
+	os.MkdirAll(appDir, 0755)
+	port := freeTCPPort(t)
+
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"legacy": {Name: "legacy", Path: appDir, StartCmd: helperRawTCPCmd(), Port: port, ProxyEnabled: true},
+	}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Start("legacy", StartOptions{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer m.Stop("legacy")
+
+	waitForRunning(t, m, "legacy", 15*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if rp := m.GetRunning("legacy"); rp != nil && rp.ProxyPort > 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Error("legacy project (no kind) should still get a proxy despite failing the HTTP check")
+}
+
+func waitForRunning(t *testing.T, m *Manager, name string, timeout time.Duration) *RunningProject {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if rp := m.GetRunning(name); rp != nil && rp.State == StateRunning {
+			return rp
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	t.Fatalf("%s never reached running state", name)
+	return nil
+}
+
+func TestVerifyDirectURL(t *testing.T) {
+	m := NewManager(t.TempDir())
+	m.SetBindHost("127.0.0.1")
+
+	if got := m.verifyDirectURL(0); got != "" {
+		t.Errorf("no port: want empty, got %q", got)
+	}
+
 	ip := localIP()
 	if ip == "localhost" {
-		return fmt.Sprintf("http://%s:%d", host, port)
+		t.Skip("no non-loopback IPv4 interface on this machine")
 	}
-	return fmt.Sprintf("http://%s:%d", ip, port)
+
+	// Loopback-only listener: not reachable on rover's advertised interface,
+	// so no direct URL may be advertised — regardless of what the app logs.
+	lb, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lb.Close()
+	if got := m.verifyDirectURL(lb.Addr().(*net.TCPAddr).Port); got != "" {
+		t.Errorf("loopback-only listener: want empty, got %q", got)
+	}
+
+	// All-interfaces listener: the socket really is reachable on rover's
+	// interface, so the verified direct URL is advertised.
+	all, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer all.Close()
+	allPort := all.Addr().(*net.TCPAddr).Port
+	want := fmt.Sprintf("http://%s:%d", ip, allPort)
+	if got := m.verifyDirectURL(allPort); got != want {
+		t.Errorf("all-interfaces listener: want %q, got %q", want, got)
+	}
+
+	// With proxy auth on, a direct link would silently bypass the auth gate,
+	// so it is never advertised even when reachable.
+	m.SetProxyAuth(true, "secret", "2278", false)
+	if got := m.verifyDirectURL(allPort); got != "" {
+		t.Errorf("proxy auth on: want empty, got %q", got)
+	}
 }
 
 func TestCaptureOutputURLDetection(t *testing.T) {
@@ -804,7 +1047,9 @@ func TestCaptureOutputURLDetection(t *testing.T) {
 
 	rp.captureOutput(stdout, stderr)
 
-	expected := wantURL("127.0.0.1", 8888)
+	// The scraped URL is kept exactly as the app printed it: it is a log
+	// line, not a verified listener, so its host must never be rewritten.
+	expected := "http://127.0.0.1:8888"
 	if rp.info.URL != expected {
 		t.Errorf("expected URL %s, got %q", expected, rp.info.URL)
 	}
@@ -830,7 +1075,7 @@ func TestCaptureOutputURLFromStderr(t *testing.T) {
 
 	rp.captureOutput(stdout, stderr)
 
-	expected := wantURL("127.0.0.1", 9000)
+	expected := "http://127.0.0.1:9000"
 	if rp.info.URL != expected {
 		t.Errorf("expected URL %s, got %q", expected, rp.info.URL)
 	}
