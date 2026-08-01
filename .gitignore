@@ -30,6 +30,11 @@ Thumbs.db
 # Rover personal data (never committed)
 projects_registry.json
 sessions.json
+# ...and any backup of them. A tool or an editor writing registry.json.bak
+# next to the real file would otherwise slip past the lines above and be
+# committed to a public repo by the next `git add -A`.
+*.json.bak
+*.bak
 
 # Machine-local launcher + secret (never committed)
 serve.local.ps1
