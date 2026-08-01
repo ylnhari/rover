@@ -185,6 +185,98 @@ func TestRegistryPortIsUsedEvenWhenBusy(t *testing.T) {
 	}
 }
 
+// The registry decides the DEFAULT port. It must never become a lock that
+// leaves an operator with no way to start a project at all — so Start consults
+// an explicit override before it reads the registry. These cover the three
+// cases where resolvePort refuses outright.
+
+// registerDemo puts a real project in rover's own registry, so Start gets past
+// its "project not found" guard and actually reaches the port logic. Without
+// this these tests would pass on the wrong error and prove nothing.
+func registerDemo(t *testing.T, m *Manager, path string) {
+	t.Helper()
+	m.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	proj := ProjectInfo{
+		Name: "demo", Path: path, Port: 8100,
+		// A command that exits immediately: these tests care about which port
+		// Start selects, not about running anything.
+		StartCmd: "cmd /c exit 0",
+	}
+	reg := roverRegistry{Projects: map[string]ProjectInfo{"demo": proj}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+	if m.GetProject("demo") == nil {
+		t.Fatal("setup failed: demo not registered")
+	}
+	t.Cleanup(func() { m.StopAll() })
+}
+
+// registryRefused reports whether the error came from the port registry as
+// opposed to anything else Start might legitimately complain about.
+func registryRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "port registry") ||
+		strings.Contains(msg, "is retired") ||
+		strings.Contains(msg, "has no port")
+}
+
+func TestExplicitPortStartsARetiredProject(t *testing.T) {
+	dir := t.TempDir()
+	reg := writePortRegistry(t, map[string]portEntry{
+		"demo": {Path: dir, Status: "retired", Note: "moved elsewhere"},
+	})
+	m := quietManager(t)
+	m.SetPortAuthority(reg)
+	registerDemo(t, m, dir)
+
+	// Without an override the registry refuses, which is the point of retiring.
+	if err := m.Start("demo", StartOptions{}); !registryRefused(err) {
+		t.Fatalf("a retired entry should refuse by default; got %v", err)
+	}
+	// With one, Start must never consult the registry at all.
+	if err := m.Start("demo", StartOptions{PortOverride: 8123}); registryRefused(err) {
+		t.Fatalf("an explicit port must bypass the registry; got %v", err)
+	}
+}
+
+func TestExplicitPortSurvivesAMalformedRegistry(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "ports.json")
+	if err := os.WriteFile(p, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := quietManager(t)
+	m.SetPortAuthority(p)
+	registerDemo(t, m, t.TempDir())
+
+	if err := m.Start("demo", StartOptions{}); !registryRefused(err) {
+		t.Fatalf("a malformed registry should refuse by default; got %v", err)
+	}
+	if err := m.Start("demo", StartOptions{PortOverride: 8124}); registryRefused(err) {
+		t.Fatalf("an explicit port must not require a readable registry; got %v", err)
+	}
+}
+
+func TestExplicitPortWorksWhenTheEntryHasNoPort(t *testing.T) {
+	dir := t.TempDir()
+	reg := writePortRegistry(t, map[string]portEntry{
+		"demo": {Path: dir, Status: "active", Note: "port deliberately unassigned"},
+	})
+	m := quietManager(t)
+	m.SetPortAuthority(reg)
+	registerDemo(t, m, dir)
+
+	if err := m.Start("demo", StartOptions{}); !registryRefused(err) {
+		t.Fatalf("an entry with no port should refuse by default; got %v", err)
+	}
+	if err := m.Start("demo", StartOptions{PortOverride: 8125}); registryRefused(err) {
+		t.Fatalf("an explicit port supplies what the entry omits; got %v", err)
+	}
+}
+
 func TestSamePathIgnoresTrailingSeparatorsAndCase(t *testing.T) {
 	if !samePath(`C:\p\demo`, `C:\p\demo\`) {
 		t.Error("a trailing separator is the same directory")

@@ -388,7 +388,10 @@ The file is the same shape the projects themselves can read:
   else that reads it sees exactly what rover sees.
 - Any allocator hint for the *next* project to be assigned is never read as a
   live port.
-- A per-run port chosen in the dashboard still wins, so you can always override.
+- **A per-run port chosen in the dashboard is consulted first, and skips the
+  registry entirely** — including when the entry is retired, has no port, or the
+  file is unreadable. The registry decides the *default*; it never becomes a
+  lock that leaves you no way to start a project at all.
 
 Without the flag none of this applies and rover behaves exactly as before.
 

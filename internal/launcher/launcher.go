@@ -566,15 +566,19 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		return fmt.Errorf("project %q not found", name)
 	}
 
-	// The external registry, when configured, outranks the port rover stored —
-	// but an explicit per-run override still outranks both, so a caller can
-	// always say what they mean.
-	port, err := m.resolvePort(proj)
-	if err != nil {
-		return err
-	}
-	if opts.PortOverride > 0 {
-		port = opts.PortOverride
+	// An explicit per-run port is the operator saying exactly what they want, so
+	// it is consulted FIRST and the registry is not read at all. Resolving first
+	// and overriding afterwards would look equivalent but is not: a corrupt
+	// registry, or an entry marked retired, fails the start before the override
+	// is ever reached — leaving no way to say "start it on this port anyway",
+	// which is precisely when you most need one.
+	port := opts.PortOverride
+	if port <= 0 {
+		resolved, err := m.resolvePort(proj)
+		if err != nil {
+			return err
+		}
+		port = resolved
 	}
 	if port > 0 && !portAvailable(port) {
 		occ := FindListenerOnPort(port)
