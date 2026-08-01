@@ -347,6 +347,58 @@ func (m *Manager) SetProxyAuth(on bool, secret, roverPort string, roverTLS bool)
 	m.roverTLS = roverTLS
 }
 
+// transparentRewrite builds the ReverseProxy rewrite hook that makes a proxied
+// request indistinguishable, to the loopback backend, from one a local client
+// made directly. This is what lets rover be a *transparent* front door: a plain
+// loopback app is reached from off-host without the app needing to know it was
+// proxied or having to whitelist the external network.
+//
+// It exists because the stock reverse proxy leaks the external client to the
+// backend in two ways, each of which a security-conscious loopback app acts on
+// and then (correctly, from its own point of view) refuses the request:
+//
+//  1. Host header. The default director forwards the client's original Host
+//     (e.g. a tailnet IP / *.ts.net name). Backends with a trusted-host /
+//     allowed-hosts / DNS-rebinding guard (Starlette's TrustedHostMiddleware,
+//     Django ALLOWED_HOSTS, Vite allowedHosts, ...) reject any Host not on their
+//     list → "Invalid host header" (400). We set the upstream Host to the
+//     loopback target, which is always on such a list, and hand the real
+//     external host to the backend via X-Forwarded-Host for the apps that build
+//     absolute URLs from it (the standard, opt-in way to learn it).
+//
+//  2. Client address. A backend server that honors forwarding headers from a
+//     loopback peer (uvicorn does so by default: proxy_headers on,
+//     forwarded_allow_ips=127.0.0.1) will read X-Forwarded-For and report the
+//     *external* client as the peer. An app that trusts only loopback callers
+//     for a sensitive path — e.g. photo-vault only injects its bearer token for
+//     a loopback client — then treats the request as remote and withholds it,
+//     so every subsequent API call is 401 "unauthorized". We send no
+//     X-Forwarded-For (and strip any the client supplied, which would be
+//     spoofed), so the backend sees its true peer: rover, on loopback.
+//
+// The deliberate trade-off: the backend can no longer distinguish an external
+// caller on its own, so rover becomes the sole authenticator for proxied apps.
+// That is already rover's role — it is the single authenticated front door, and
+// its proxies only bind to the interface rover itself is exposed on.
+func transparentRewrite(target *url.URL) func(*httputil.ProxyRequest) {
+	return func(pr *httputil.ProxyRequest) {
+		origHost := pr.In.Host
+		scheme := "http"
+		if pr.In.TLS != nil {
+			scheme = "https"
+		}
+		pr.SetURL(target)
+		// Present a genuine loopback request to the backend.
+		pr.Out.Host = target.Host
+		// Preserve the external origin for backends that build absolute URLs,
+		// but never leak the client IP.
+		pr.Out.Header.Set("X-Forwarded-Host", origHost)
+		pr.Out.Header.Set("X-Forwarded-Proto", scheme)
+		pr.Out.Header.Del("X-Forwarded-For")
+		pr.Out.Header.Del("Forwarded")
+	}
+}
+
 // startProxy binds a reverse proxy for rp on the requested port (0 = ephemeral)
 // on rover's own interface. Requests are gated on the tracked process still
 // being alive — the proxy never forwards to a port whose owner has exited —
@@ -361,7 +413,7 @@ func (m *Manager) startProxy(rp *runningProcess, targetPort, proxyPort int) (net
 	pport := ln.Addr().(*net.TCPAddr).Port
 
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", targetPort))
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := &httputil.ReverseProxy{Rewrite: transparentRewrite(target)}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rp.exited.Load() {

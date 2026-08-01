@@ -1357,6 +1357,7 @@ var webUI = []byte(`<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
 <meta name="theme-color" content="#0a0d12">
 <title>Rover</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%23818cf8'/><stop offset='.55' stop-color='%236366f1'/><stop offset='1' stop-color='%234338ca'/></linearGradient></defs><rect width='64' height='64' rx='15' fill='url(%23g)'/><rect x='1.5' y='1.5' width='61' height='61' rx='13.5' fill='none' stroke='white' stroke-opacity='.25' stroke-width='1.5'/><path d='M20 24 L30 32 L20 40' fill='none' stroke='white' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/><path d='M34 41 L45 41' fill='none' stroke='white' stroke-width='5' stroke-linecap='round'/></svg>">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{

@@ -1320,6 +1320,67 @@ func TestUpdateProjectPort(t *testing.T) {
 	}
 }
 
+func TestProxyPresentsLoopbackRequest(t *testing.T) {
+	// The proxy must make a request look, to the loopback backend, like a local
+	// client made it directly: upstream Host rewritten to the loopback target
+	// (so trusted-host guards accept it), no X-Forwarded-For (so servers that
+	// honor it don't see the request as remote and disable loopback-only paths),
+	// and the real external host preserved in X-Forwarded-Host. See
+	// transparentRewrite for the full rationale.
+	type captured struct{ host, xff, xfh, xfproto string }
+	seen := make(chan captured, 1)
+	backend := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- captured{
+			host:    r.Host,
+			xff:     r.Header.Get("X-Forwarded-For"),
+			xfh:     r.Header.Get("X-Forwarded-Host"),
+			xfproto: r.Header.Get("X-Forwarded-Proto"),
+		}
+		fmt.Fprint(w, "ok")
+	})}
+	bln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bln.Close()
+	backendPort := bln.Addr().(*net.TCPAddr).Port
+	go backend.Serve(bln)
+	defer backend.Close()
+
+	m := NewManager(t.TempDir())
+	m.SetBindHost("127.0.0.1")
+	rp := &runningProcess{done: make(chan struct{})}
+	pln, srv, pport, err := m.startProxy(rp, backendPort, 0)
+	if err != nil {
+		t.Fatalf("startProxy: %v", err)
+	}
+	defer srv.Close()
+	defer pln.Close()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", pport), nil)
+	req.Host = "phone.example.ts.net:20128"          // external host a phone would send
+	req.Header.Set("X-Forwarded-For", "203.0.113.9") // a value the client tried to spoof
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	got := <-seen
+	if want := fmt.Sprintf("127.0.0.1:%d", backendPort); got.host != want {
+		t.Errorf("upstream Host = %q, want loopback target %q", got.host, want)
+	}
+	if got.xff != "" {
+		t.Errorf("X-Forwarded-For reached backend = %q, want empty (no client identity leaked)", got.xff)
+	}
+	if got.xfh != "phone.example.ts.net:20128" {
+		t.Errorf("X-Forwarded-Host = %q, want the original external host", got.xfh)
+	}
+	if got.xfproto != "http" {
+		t.Errorf("X-Forwarded-Proto = %q, want http", got.xfproto)
+	}
+}
+
 func TestProxyURLHost(t *testing.T) {
 	// A specific routable bind host is advertised verbatim (what a remote
 	// client should hit). Loopback / all-interfaces binds fall back to a
