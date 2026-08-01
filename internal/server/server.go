@@ -440,6 +440,10 @@ type Config struct {
 	ExecTimeout  time.Duration
 	MaxOutput    int64
 	ProjectsRoot string
+	// PortRegistry is an optional ports.json-format file that decides project
+	// ports, matched by path. Empty = use the ports stored in rover's own
+	// project registry, which is the default behavior.
+	PortRegistry string
 	AllowCmds    []string // if non-empty, only commands with a matching prefix are permitted
 	SessionsFile string   // path to sessions persistence file; empty = no persistence
 	LogFormat    string   // "text" (default) or "json"
@@ -550,6 +554,7 @@ func New(cfg Config) *Server {
 
 	if cfg.ProjectsRoot != "" {
 		s.launcher = launcher.NewManager(cfg.ProjectsRoot)
+		s.launcher.SetPortAuthority(cfg.PortRegistry)
 		s.launcher.SetLogger(func(msg string, args ...any) {
 			s.logger.Info(fmt.Sprintf(msg, args...))
 		})

@@ -214,9 +214,13 @@ func (rp *runningProcess) appendOutput(s string) {
 type Manager struct {
 	projectsRoot string
 	registryPath string
-	procs        map[string]*runningProcess
-	lastExits    map[string]ExitStatus
-	mu           sync.Mutex
+	// portAuthority, when set, is an external ports.json-format file that
+	// decides each project's port instead of the one stored in registryPath.
+	// Empty = today's behavior. See portregistry.go.
+	portAuthority string
+	procs         map[string]*runningProcess
+	lastExits     map[string]ExitStatus
+	mu            sync.Mutex
 	// regMu serializes registry read-modify-write cycles: HTTP handlers and
 	// the async proxy starter (persistProxyPort) mutate the file concurrently.
 	regMu sync.Mutex
@@ -509,8 +513,23 @@ func (m *Manager) RegistryPath() string {
 
 func (m *Manager) Scan() []ProjectInfo {
 	reg := loadRoverRegistry(m.registryPath)
+	// Report the port a start would actually use. Showing the stored one while
+	// launching on another is how a dashboard ends up attributing the wrong
+	// service to a project — the failure this whole mechanism exists to avoid.
+	var ports *portRegistry
+	if m.portAuthority != "" {
+		if pr, err := loadPortRegistry(m.portAuthority); err == nil {
+			ports = pr
+		} else {
+			m.logf("launcher: port registry unreadable (%v); showing stored ports", err)
+		}
+	}
 	result := make([]ProjectInfo, 0, len(reg.Projects))
 	for _, p := range reg.Projects {
+		if e, _, ok := ports.lookup(p.Name, p.Path); ok && e.Port > 0 &&
+			!strings.EqualFold(e.Status, "retired") {
+			p.Port = e.Port
+		}
 		result = append(result, p)
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -547,7 +566,13 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		return fmt.Errorf("project %q not found", name)
 	}
 
-	port := proj.Port
+	// The external registry, when configured, outranks the port rover stored —
+	// but an explicit per-run override still outranks both, so a caller can
+	// always say what they mean.
+	port, err := m.resolvePort(proj)
+	if err != nil {
+		return err
+	}
 	if opts.PortOverride > 0 {
 		port = opts.PortOverride
 	}

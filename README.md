@@ -39,6 +39,7 @@ Open [http://localhost:2278](http://localhost:2278) and log in with your secret.
 - **Live console streaming** — view project logs in real time via SSE (bounded in-memory history)
 - **Reverse proxy (default ON)** — Rover can proxy requests to apps bound to `127.0.0.1`, making them accessible via Tailscale/LAN without changing app configuration. Proxy ports are stable across restarts (bookmarkable); the proxy stops forwarding the moment the app dies. Toggle per-project in the dashboard.
 - **Persistent registry** — projects are saved to `projects_registry.json` (git-ignored, atomic 0600 writes)
+- **External port registry (`--registry`, optional)** — point rover at a shared `ports.json` and it becomes the authority for which port each project runs on, matched by project path. Useful when the projects themselves, their start scripts, and rover all need to agree on one number; without the flag rover uses its own stored ports exactly as before. See [Port registry](#port-registry)
 - **Clean shutdown** — all launched projects are killed when Rover exits
 
 ### Security
@@ -96,6 +97,8 @@ Flags:
   --exec-timeout   duration    max run time per command              (default: 10m)
   --max-output     int         max output bytes per command          (default: 1MB)
   --projects-dir   path        projects root directory
+  --registry       path        ports.json-format port registry (or $ROVER_REGISTRY);
+                               when set it decides each project's port  (default: off)
   --log-format     text|json   log output format                     (default: text)
   --no-command-guard           allow interactive/GUI/stateful commands (default: blocked)
   --proxy-auth     auto|on|off require rover login for project proxies (default: auto —
@@ -342,6 +345,52 @@ tailnet without per-network configuration.
 - **Performance:** the proxy adds one same-machine loopback hop — well under a
   millisecond, with streamed bodies and WebSocket/SSE support. Real-world latency is
   dominated by your network path, not the proxy.
+
+---
+
+## Port registry
+
+By default rover keeps each project's port in its own `projects_registry.json`.
+That is fine until something else needs to know the same number — the app's own
+start script, a helper that reads a port from config, a person running it by
+hand. Two places recording the same fact eventually disagree, and when they do,
+whatever attributes a service *by port* (a reverse proxy, service discovery,
+rover itself) quietly labels the wrong app.
+
+`--registry` makes one external file the authority:
+
+```sh
+rover serve --registry /path/to/ports.json
+# or: ROVER_REGISTRY=/path/to/ports.json rover serve
+```
+
+The file is the same shape the projects themselves can read:
+
+```json
+{
+  "registry": {
+    "some-app": { "port": 8766, "path": "/abs/path/to/some-app", "status": "active" },
+    "old-app":  { "path": "/abs/path/to/old-app", "status": "retired",
+                  "note": "merged into some-app" }
+  }
+}
+```
+
+- **Matched by `path`**, falling back to the project name. The two files often
+  name a project differently (a display name here, a slug there) but both record
+  an absolute path, which is unambiguous.
+- **A retired entry, or one with no port, refuses to start** — and rover shows
+  the entry's `note`, so retiring a project in one file actually stops it
+  everywhere instead of leaving rover to launch it on a port it still remembers.
+- **An unreadable or malformed file is an error**, not a quiet fallback to the
+  stored port. Falling back is how the two sources drift apart unnoticed.
+- **Rover never writes to this file.** It stays yours to edit, and everything
+  else that reads it sees exactly what rover sees.
+- Any allocator hint for the *next* project to be assigned is never read as a
+  live port.
+- A per-run port chosen in the dashboard still wins, so you can always override.
+
+Without the flag none of this applies and rover behaves exactly as before.
 
 ---
 

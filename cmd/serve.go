@@ -37,6 +37,7 @@ func runServe(args []string) error {
 	proxyAuth := fs.String("proxy-auth", "auto", "require rover login for project proxies: auto|on|off (auto = off on loopback/tailnet binds, on elsewhere)")
 	takeoverPort := fs.Bool("takeover-port", false, "if rover's own port is occupied, kill the listener instead of failing (default: fail and name the occupant)")
 	validationTimeout := fs.Duration("validation-timeout", 30*time.Second, "how long project registration/start probes wait for the app to start listening")
+	registry := fs.String("registry", "", "path to a ports.json-format port registry (or $ROVER_REGISTRY); when set it decides each project's port, matched by project path")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -102,6 +103,19 @@ func runServe(args []string) error {
 		}
 	}
 
+	portRegistry := *registry
+	if portRegistry == "" {
+		portRegistry = os.Getenv("ROVER_REGISTRY")
+	}
+	if portRegistry != "" {
+		// Fail here rather than at the first start attempt: an operator who
+		// pointed rover at a registry wants to know now if it is unreadable.
+		if _, err := os.Stat(portRegistry); err != nil {
+			return fmt.Errorf("--registry %s: %w", portRegistry, err)
+		}
+		fmt.Printf("Port registry:  %s\n", portRegistry)
+	}
+
 	return server.New(server.Config{
 		Addr:                *addr,
 		Secret:              sec,
@@ -110,6 +124,7 @@ func runServe(args []string) error {
 		ExecTimeout:         *execTimeout,
 		MaxOutput:           *maxOutput,
 		ProjectsRoot:        projectsRoot,
+		PortRegistry:        portRegistry,
 		AllowCmds:           allowCmds,
 		SessionsFile:        defaultSessionsFile(),
 		LogFormat:           *logFormat,
