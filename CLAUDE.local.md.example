@@ -1,9 +1,9 @@
-# Personal / machine-local — rover
-# Copy this file to CLAUDE.local.md (gitignored) and fill in your values.
-# Claude Code auto-loads CLAUDE.local.md alongside CLAUDE.md.
+# Claude-specific personal / machine-local overlay — rover
+# Copy this file to CLAUDE.local.md (gitignored) only when Claude has been
+# configured to load it. Other hosts use AGENTIC.local.md where supported.
 
 - Repo path: <absolute path to this repo on your machine>
 - Port registry: <path to ports.json> (rover's registered port)
 - `ROVER_SECRET`: where it's stored on this machine (e.g. a User env var) — never in a file that gets committed.
 - Restart script for the live tailnet instance, if you have one (e.g. a gitignored `serve.local.ps1`).
-- Global rules in `~/.claude/CLAUDE.md` apply.
+- Read the shared baseline through this repository's AGENTS.md adapter.

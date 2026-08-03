@@ -42,6 +42,7 @@ rover.secret.env
 
 # Claude personal/machine-local memory (template .example is committed)
 CLAUDE.local.md
+AGENTIC.local.md
 
 # Claude Code settings
 .claude/

@@ -1,0 +1,10 @@
+# Machine-local overlay — rover
+
+# Copy to AGENTIC.local.md (gitignored) when the active host is configured to
+# read it. Do not put credential values here.
+
+- Repo path: <absolute path to this repository on this machine>
+- Port registry: <local registry path and rover entry>
+- `ROVER_SECRET`: reference only the supported local secret source (for example,
+  a user environment variable); never copy its value.
+- Live restart method: <gitignored local script or documented command>

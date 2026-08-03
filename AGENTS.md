@@ -1,6 +1,9 @@
 # Rover project instructions
 
-> **Setup:** use the active host's gitignored local-instruction/config file for machine-local values. Personal/global preferences live in the shared user-level baseline.
+> **Setup:** use `AGENTIC.local.md` (copied from its tracked example) for
+> machine-local values that any host may read when configured. A native host
+> may additionally use its own ignored local adapter. Personal/global
+> preferences live in the shared user-level baseline.
 
 ## Role
 Maintain rover: a zero-dependency, single-binary remote shell + project launcher (Go). Unlike a typical local-only app, rover is *meant* to be reachable off-loopback (e.g. over a Tailscale tailnet): its entire job is being the authenticated front door. See README's Security Considerations for the threat model.
@@ -25,4 +28,6 @@ Default branch **master**, remote `github.com/ylnhari/rover`. Machine-local deta
 go build -o rover.exe .
 ./rover.exe serve --addr 127.0.0.1:2279     # local test, no secret needed
 ```
-See the active host's ignored local configuration for how to restart the live tailnet instance and where `ROVER_SECRET` is stored on this machine.
+See `AGENTIC.local.md` or the active host's ignored native adapter for how to
+restart the live tailnet instance and where `ROVER_SECRET` is stored on this
+machine.
