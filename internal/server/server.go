@@ -2212,7 +2212,7 @@ const dotCls=status==='running'?'running':status==='starting'?'starting':status=
 const statusLabel=statusLabelFor(p,status);
 const urlHtml=p.direct_url?directUrlHtml(p.direct_url):(p.is_running&&p.running_url?localUrlHtml(p.running_url):'');
 const proxyHref=p.proxy_url?displayUrl(p.proxy_url):'';
-const proxyUrlHtml=proxyHref?'<a href="'+esc(proxyHref)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(proxyHref)+'</a>':'';
+const proxyUrlHtml=proxyHref?'Rover proxy <a href="'+esc(proxyHref)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(proxyHref)+'</a>':'';
 const proxyErrHtml=p.proxy_error?'<span class="meta-chip" style="color:#e5484d" title="'+esc(p.proxy_error)+'">⚠ proxy failed</span>':'';
 const isTask=p.kind==='task';
 const kindChip=isTask?'<span class="meta-chip" title="Port-less task: rover runs it and shows its console; there is no web UI to open.">task</span>':(p.kind==='tcp'?'<span class="meta-chip" title="The app listens but did not answer HTTP, so rover cannot proxy it. Reach it directly on its port.">TCP · no proxy</span>':'');
@@ -2225,7 +2225,7 @@ html+='<div class="project-card" data-name="'+esc(p.name)+'">'+
 '<button class="btn-remove" data-project="'+esc(p.name)+'" title="Remove project">✕</button>'+
 '</div>'+
 '<div class="project-meta">'+
-(isTask?'':'<span class="meta-chip">Port <b>'+(p.port||'—')+'</b></span>')+
+(isTask?'':'<span class="meta-chip">Local app port <b>'+(p.port||'—')+'</b></span>')+
 kindChip+
 '<span id="url-'+esc(p.name)+'">'+urlHtml+'</span>'+
 '<span id="proxyurl-'+esc(p.name)+'">'+proxyUrlHtml+'</span>'+
@@ -2461,7 +2461,7 @@ if(stopBtn)stopBtn.disabled=false;
 }else if(d.type==='proxy'){
 const pEl=$('proxyurl-'+name);
 const href=displayUrl(d.data);
-if(pEl)pEl.innerHTML='<a href="'+esc(href)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(href)+'</a>';
+if(pEl)pEl.innerHTML='Rover proxy <a href="'+esc(href)+'" target="_blank" rel="noopener" class="project-url proxy">⎐ '+esc(href)+'</a>';
 }else if(d.type==='exit'){
 exitCode=parseInt(d.data,10);
 }else if(d.type==='done'){

@@ -139,6 +139,13 @@ func TestWebUI(t *testing.T) {
 	if !strings.Contains(string(body), "Rover") {
 		t.Error("expected HTML to contain 'Rover'")
 	}
+	page := string(body)
+	if !strings.Contains(page, "Local app port") {
+		t.Error("expected the Projects UI to identify the application port as local")
+	}
+	if !strings.Contains(page, "Rover proxy") {
+		t.Error("expected the Projects UI to identify remote links as Rover proxies")
+	}
 }
 
 func TestWebUIWithoutProjects(t *testing.T) {

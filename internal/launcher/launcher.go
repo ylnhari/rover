@@ -475,18 +475,25 @@ func (m *Manager) startProxyFor(name string, rp *runningProcess, proj ProjectInf
 		rp.outputMu.Unlock()
 		return
 	}
+	proxyURL := fmt.Sprintf("http://%s:%d", proxyURLHost(m.bindHost), pport)
+	// Install the listener before persisting so Stop can always tear it down,
+	// but do not publish ProxyPort/ProxyURL to readers until the registry write
+	// has completed. Otherwise the API can briefly report a proxy port that is
+	// not yet persisted, making a stable-port read immediately after startup
+	// race the atomic registry update.
 	rp.outputMu.Lock()
 	rp.proxyLn = ln
 	rp.proxyServer = srv
-	rp.info.ProxyPort = pport
-	rp.info.ProxyURL = fmt.Sprintf("http://%s:%d", proxyURLHost(m.bindHost), pport)
-	proxyURL := rp.info.ProxyURL
 	rp.outputMu.Unlock()
 	if pport != proj.ProxyPort {
 		if err := m.persistProxyPort(name, pport); err != nil {
 			m.logf("launcher: could not persist proxy port for %s: %v", name, err)
 		}
 	}
+	rp.outputMu.Lock()
+	rp.info.ProxyPort = pport
+	rp.info.ProxyURL = proxyURL
+	rp.outputMu.Unlock()
 	rp.broadcast(StreamEvent{Type: "proxy", Data: proxyURL})
 }
 
