@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/ylnhari/rover/internal/auth"
+	"github.com/ylnhari/rover/internal/childenv"
 	"github.com/ylnhari/rover/internal/launcher"
 	"github.com/ylnhari/rover/internal/version"
 )
@@ -298,6 +299,7 @@ func (sm *SessionManager) execute(s *Session) {
 
 	shell, flag := platformShell()
 	cmd := exec.CommandContext(ctx, shell, flag, s.Command)
+	cmd.Env = childenv.Filter(os.Environ())
 
 	outPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -451,8 +453,9 @@ type Config struct {
 	// stateful commands that can't work in rover's non-interactive shell.
 	// Default (false) = guard enabled.
 	DisableCommandGuard bool
-	// ProxyAuthOn gates project reverse proxies behind a signed rover cookie
-	// (resolved from --proxy-auth by the CLI).
+	// ProxyAuthOn globally gates project reverse proxies behind a signed rover
+	// cookie (resolved from --proxy-auth by the CLI). A project's RequiresAuth
+	// flag is enforced even when this value is false.
 	ProxyAuthOn bool
 	// ValidationTimeout bounds how long project registration / start probes
 	// wait for the app to begin listening.
@@ -1116,6 +1119,7 @@ func (s *Server) handleAddProject(w http.ResponseWriter, r *http.Request) {
 		"url":           p.URL,
 		"kind":          p.Kind,
 		"proxy_enabled": p.ProxyEnabled,
+		"requires_auth": p.RequiresAuth,
 		"report":        report,
 	})
 }
@@ -1301,13 +1305,16 @@ func proxyCookie(token string) *http.Cookie {
 // cookie (requireAuth has verified the token before this runs). The UI calls
 // it before following a ?next= redirect back to a proxied app.
 func (s *Server) handleProxyCookie(w http.ResponseWriter, r *http.Request) {
-	token := r.Header.Get("X-Rover-Secret")
-	if token == "" {
-		token = r.URL.Query().Get("secret")
+	if s.cfg.Secret == "" {
+		jsonError(w, "proxy authentication requires a rover secret", http.StatusConflict)
+		return
 	}
-	if token != "" {
-		http.SetCookie(w, proxyCookie(token))
+	proxyToken, err := auth.IssueProxyToken(s.cfg.Secret)
+	if err != nil {
+		jsonError(w, "failed to issue proxy credential", http.StatusInternalServerError)
+		return
 	}
+	http.SetCookie(w, proxyCookie(proxyToken))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1345,12 +1352,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "failed to issue token", http.StatusInternalServerError)
 		return
 	}
+	proxyToken, err := auth.IssueProxyToken(s.cfg.Secret)
+	if err != nil {
+		jsonError(w, "failed to issue proxy credential", http.StatusInternalServerError)
+		return
+	}
 	ip2, _, _ := net.SplitHostPort(r.RemoteAddr)
 	s.logger.Info("login", "src", ip2)
 	expiresAt := time.Now().Add(auth.TokenTTL).UTC().Format(time.RFC3339)
-	// The same signed token doubles as the proxy-auth cookie: cookies are
-	// per-host, so it authenticates this browser to every proxy port too.
-	http.SetCookie(w, proxyCookie(token))
+	// Proxy cookies use a purpose-separated credential that control APIs reject.
+	http.SetCookie(w, proxyCookie(proxyToken))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": token, "expires_at": expiresAt})
 }

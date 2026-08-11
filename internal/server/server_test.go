@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ylnhari/rover/internal/auth"
 	"github.com/ylnhari/rover/internal/server"
 )
 
@@ -222,6 +224,30 @@ func TestLogin(t *testing.T) {
 	if loginResp.ExpiresAt == "" {
 		t.Error("want non-empty expires_at on successful login")
 	}
+	var proxyCredential string
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "rover_proxy" {
+			proxyCredential = cookie.Value
+			break
+		}
+	}
+	if proxyCredential == "" {
+		t.Fatal("successful login did not set rover_proxy cookie")
+	}
+	if proxyCredential == loginResp.Token {
+		t.Fatal("proxy cookie reused the control API token")
+	}
+	if err := auth.VerifyProxyToken(testSecret, proxyCredential); err != nil {
+		t.Fatalf("proxy cookie is not a valid scoped proxy credential: %v", err)
+	}
+	if err := auth.VerifyToken(testSecret, proxyCredential); err == nil {
+		t.Fatal("proxy cookie credential was accepted as a control API token")
+	}
+	apiResp := getJSON(t, ts.URL+"/api/config", proxyCredential)
+	apiResp.Body.Close()
+	if apiResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("proxy credential authorized control API: status %d", apiResp.StatusCode)
+	}
 
 	// Wrong secret
 	body = `{"secret":"wrong"}`
@@ -257,6 +283,59 @@ func TestLoginSecretLessMode(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("want 200 in secret-less mode, got %d", resp.StatusCode)
+	}
+}
+
+func TestProxyCookieEndpointMintsScopedCredential(t *testing.T) {
+	dir := t.TempDir()
+	ts := httptest.NewServer(server.New(server.Config{
+		Addr:         "127.0.0.1:2278",
+		ProjectsRoot: dir,
+		Secret:       testSecret,
+	}).Handler())
+	defer ts.Close()
+	controlToken := loginToken(t, ts.URL, testSecret)
+
+	resp := getJSON(t, ts.URL+"/api/proxy-cookie", controlToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("proxy-cookie status = %d; want 204", resp.StatusCode)
+	}
+	var proxyCredential string
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "rover_proxy" {
+			proxyCredential = cookie.Value
+			break
+		}
+	}
+	if proxyCredential == "" {
+		t.Fatal("proxy-cookie endpoint did not set rover_proxy")
+	}
+	if proxyCredential == controlToken {
+		t.Fatal("proxy-cookie endpoint copied the control API token")
+	}
+	if err := auth.VerifyProxyToken(testSecret, proxyCredential); err != nil {
+		t.Fatalf("proxy-cookie endpoint returned invalid scoped credential: %v", err)
+	}
+}
+
+func TestProxyCookieEndpointFailsClosedWithoutSecret(t *testing.T) {
+	dir := t.TempDir()
+	ts := httptest.NewServer(server.New(server.Config{
+		Addr:         "127.0.0.1:2278",
+		ProjectsRoot: dir,
+	}).Handler())
+	defer ts.Close()
+
+	resp := getJSON(t, ts.URL+"/api/proxy-cookie", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("proxy-cookie status = %d; want 409 without a secret", resp.StatusCode)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "rover_proxy" {
+			t.Fatal("secret-less proxy-cookie endpoint minted a credential")
+		}
 	}
 }
 
@@ -356,6 +435,62 @@ func TestCreateAndGetSession(t *testing.T) {
 	}
 	if !strings.Contains(detail.Stdout, "hello world") {
 		t.Errorf("want stdout to contain 'hello world', got %q", detail.Stdout)
+	}
+}
+
+func TestSessionChildDoesNotInheritSecrets(t *testing.T) {
+	t.Setenv("ROVER_SECRET", "test-only")
+	t.Setenv("ROVER_PROXY_VERIFY", "untrusted-parent-value")
+	t.Setenv("ROVER_TEST_CHILD_TOKEN", "test-only")
+	t.Setenv("ROVER_TEST_CHILD_KEY", "test-only")
+	ts, token := newTestServer(t)
+
+	var command string
+	if runtime.GOOS == "windows" {
+		command = "if defined ROVER_SECRET (exit /b 91) else if defined ROVER_PROXY_VERIFY (exit /b 92) else if defined ROVER_TEST_CHILD_TOKEN (exit /b 93) else if defined ROVER_TEST_CHILD_KEY (exit /b 94) else (echo clean)"
+	} else {
+		command = "if [ \"${ROVER_SECRET+x}\" = x ] || [ \"${ROVER_PROXY_VERIFY+x}\" = x ] || [ \"${ROVER_TEST_CHILD_TOKEN+x}\" = x ] || [ \"${ROVER_TEST_CHILD_KEY+x}\" = x ]; then exit 91; fi; printf clean"
+	}
+	resp := postJSON(t, ts.URL+"/api/sessions", fmt.Sprintf(`{"command":%q}`, command), token)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create session status = %d: %s", resp.StatusCode, body)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+
+	var detail struct {
+		Status   string `json:"status"`
+		ExitCode int    `json:"exit_code"`
+		Stdout   string `json:"stdout"`
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		result := getJSON(t, ts.URL+"/api/sessions/"+created.ID, token)
+		if result.StatusCode != http.StatusOK {
+			result.Body.Close()
+			t.Fatalf("session detail status = %d", result.StatusCode)
+		}
+		if err := json.NewDecoder(result.Body).Decode(&detail); err != nil {
+			result.Body.Close()
+			t.Fatal(err)
+		}
+		result.Body.Close()
+		if detail.Status != "running" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if detail.Status != "completed" || detail.ExitCode != 0 {
+		t.Fatalf("child observed a sensitive environment variable: status=%s exit=%d", detail.Status, detail.ExitCode)
+	}
+	if strings.TrimSpace(detail.Stdout) != "clean" {
+		t.Fatalf("unexpected child output: %q", detail.Stdout)
 	}
 }
 
@@ -588,6 +723,28 @@ func TestHelperHTTPServer(t *testing.T) {
 	srv.ListenAndServe()
 }
 
+func TestHelperOneShotHTTPServer(t *testing.T) {
+	if os.Getenv("ROVER_TEST_ONE_SHOT_HTTP_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		t.Fatal("PORT not set")
+	}
+	var srv http.Server
+	srv.Addr = "127.0.0.1:" + port
+	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "helper ok")
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			srv.Close()
+		}()
+	})
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		t.Fatal(err)
+	}
+}
+
 func freeTCPPort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -600,7 +757,7 @@ func freeTCPPort(t *testing.T) int {
 }
 
 func TestAddAndRemoveProject(t *testing.T) {
-	t.Setenv("ROVER_TEST_HELPER", "1")
+	t.Setenv("ROVER_TEST_ONE_SHOT_HTTP_HELPER", "1")
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, "testapp"), 0755)
 
@@ -612,7 +769,7 @@ func TestAddAndRemoveProject(t *testing.T) {
 	// an HTTP server (see TestHelperHTTPServer). The {port} placeholder is
 	// absorbed by a harmless -test.skip regex so no --port flag is appended;
 	// the helper reads the PORT env var.
-	startCmd := os.Args[0] + " -test.run=^TestHelperHTTPServer$ -test.skip=p{port}"
+	startCmd := os.Args[0] + " -test.run=^TestHelperOneShotHTTPServer$ -test.skip=p{port}"
 	port := freeTCPPort(t)
 
 	body := fmt.Sprintf(`{"name":"testapp","start_cmd":%q,"port":%d}`, startCmd, port)
@@ -624,10 +781,11 @@ func TestAddAndRemoveProject(t *testing.T) {
 	}
 
 	var proj struct {
-		Name   string `json:"name"`
-		Port   int    `json:"port"`
-		URL    string `json:"url"`
-		Report struct {
+		Name         string `json:"name"`
+		Port         int    `json:"port"`
+		URL          string `json:"url"`
+		RequiresAuth bool   `json:"requires_auth"`
+		Report       struct {
 			Probe struct {
 				Listening bool `json:"listening"`
 				HTTP      bool `json:"http"`
@@ -640,6 +798,9 @@ func TestAddAndRemoveProject(t *testing.T) {
 	}
 	if proj.Port != port {
 		t.Errorf("want port %d, got %d", port, proj.Port)
+	}
+	if !proj.RequiresAuth {
+		t.Error("new project response must report requires_auth=true")
 	}
 	if !proj.Report.Probe.Listening || !proj.Report.Probe.HTTP {
 		t.Errorf("expected listening+http probe in response, got %+v", proj.Report)

@@ -34,7 +34,7 @@ func runServe(args []string) error {
 	allow := fs.String("allow", "", "comma-separated command prefixes to allow (empty = allow all); also applies to project start commands")
 	logFormat := fs.String("log-format", "text", "log output format: text or json")
 	noGuard := fs.Bool("no-command-guard", false, "allow interactive/GUI/stateful commands that normally can't work over rover (default: blocked)")
-	proxyAuth := fs.String("proxy-auth", "auto", "require rover login for project proxies: auto|on|off (auto = off on loopback/tailnet binds, on elsewhere)")
+	proxyAuth := fs.String("proxy-auth", "auto", "globally require rover login for project proxies: auto|on|off; per-project requires_auth is always enforced")
 	takeoverPort := fs.Bool("takeover-port", false, "if rover's own port is occupied, kill the listener instead of failing (default: fail and name the occupant)")
 	validationTimeout := fs.Duration("validation-timeout", 30*time.Second, "how long project registration/start probes wait for the app to start listening")
 	registry := fs.String("registry", "", "path to a ports.json-format port registry (or $ROVER_REGISTRY); when set it decides each project's port, matched by project path")
@@ -74,8 +74,8 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	if !proxyAuthOn && !isLoopbackBind(host) && !isTailnetBind(host) {
-		fmt.Printf("WARNING: bound to %q with proxy auth OFF — every proxied project is reachable WITHOUT authentication on that network. Use --proxy-auth on, or bind to a Tailscale IP.\n", *addr)
+	if !proxyAuthOn && !isLoopbackBind(host) {
+		fmt.Printf("WARNING: bound to %q with global proxy auth OFF — projects without requires_auth are reachable WITHOUT authentication on that network. Use --proxy-auth on, require auth per project, or bind to a Tailscale IP.\n", *addr)
 	}
 
 	if err := ensurePortFree(*addr, *takeoverPort); err != nil {
@@ -135,9 +135,16 @@ func runServe(args []string) error {
 }
 
 // resolveProxyAuth turns the --proxy-auth mode into an effective on/off.
-// "auto" = off when the proxies can only be reached from trusted networks
-// (loopback, or a Tailscale CGNAT address where the tailnet's WireGuard device
-// auth is the boundary), on everywhere else (LAN / all-interfaces binds).
+// "auto" = off only for a loopback bind, where nothing off-machine can reach
+// the proxy at all. Anywhere reachable by another device - LAN, all-interfaces,
+// or a Tailscale CGNAT address - resolves on.
+//
+// A tailnet used to be treated as trusted enough on the grounds that WireGuard
+// device auth is the boundary. That reasoning does not survive contact with
+// what the proxy actually carries: every device on the tailnet, every process
+// on those devices, and any web page they open could reach a proxied app with
+// no rover credential, while rover's own API correctly answered 401 over the
+// same transport. The proxy was the weaker door to the more sensitive data.
 func resolveProxyAuth(mode, host, secret string) (bool, error) {
 	switch mode {
 	case "on":
@@ -148,7 +155,7 @@ func resolveProxyAuth(mode, host, secret string) (bool, error) {
 	case "off":
 		return false, nil
 	case "auto":
-		if secret == "" || isLoopbackBind(host) || isTailnetBind(host) {
+		if secret == "" || isLoopbackBind(host) {
 			return false, nil
 		}
 		return true, nil

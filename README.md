@@ -46,7 +46,10 @@ Open [http://localhost:2278](http://localhost:2278) and log in with your secret.
 - **HMAC-SHA256 session tokens** — login returns a signed, time-limited token (24h TTL); the raw secret is never stored in the browser
 - **`X-Rover-Secret` header auth** — all protected endpoints require the token header
 - **Secret required off-loopback** — Rover refuses to start without a secret unless bound to `127.0.0.1`; secret-less mode can never expose the host to the network
-- **Proxy auth (`--proxy-auth auto|on|off`)** — project proxies can require the same rover login via a signed HttpOnly cookie; `auto` keeps them open on loopback/Tailscale binds (where the network is the boundary) and gates them everywhere else
+- **Per-project proxy auth** — newly registered projects default to `requires_auth: true`; that gate is enforced even when the global `--proxy-auth` mode resolves off
+- **Scoped proxy credentials** — the HttpOnly proxy cookie is cryptographically distinct from the control API token and is stripped before forwarding
+- **Authenticated downstream identity** — rover strips spoofable forwarding/identity headers and adds a fresh method/path-bound `X-Rover-Proxy` proof using a project-scoped verifier value
+- **Child credential isolation** — launched commands and projects do not inherit `ROVER_SECRET` or environment variables ending in `_SECRET`, `_TOKEN`, or `_KEY`
 - **Rate-limited login** — 10 attempts per IP per minute
 - **Command allowlist** — `--allow git,go test,npm` blocks everything else, **including project start commands**
 - **No blind kills** — neither project start nor rover's own startup ever `kill -9`s a port occupant without explicit confirmation (`--takeover-port` / confirmed PID)
@@ -101,8 +104,8 @@ Flags:
                                when set it decides each project's port  (default: off)
   --log-format     text|json   log output format                     (default: text)
   --no-command-guard           allow interactive/GUI/stateful commands (default: blocked)
-  --proxy-auth     auto|on|off require rover login for project proxies (default: auto —
-                               off on loopback/Tailscale binds, on elsewhere)
+  --proxy-auth     auto|on|off globally require login for project proxies;
+                               per-project requires_auth is always enforced
   --takeover-port              kill whatever holds rover's own port instead of failing
                                with the occupant's identity (default: fail and name it)
   --validation-timeout dur     how long registration/start probes wait for the app
@@ -162,7 +165,7 @@ All protected endpoints require the `X-Rover-Secret: <token>` header, where `<to
 | GET | `/api/config` | ✓ | Get exec timeout and max output |
 | PUT | `/api/config` | ✓ | Update exec timeout and max output |
 | GET | `/api/projects` | ✓ | List registered projects. Per running project: `running_url` (app-reported, informational), `direct_url` (present only when socket-verified reachable on rover's interface), `proxy_url`, `kind` (`web`/`tcp`/`task`). The response carries an `X-Rover-Local-Viewer: 1\|0` header telling the client whether this request came from the rover host itself |
-| POST | `/api/projects` | ✓ | Add a project (validates by starting it). `port: 0` or omitted registers a port-less **task** |
+| POST | `/api/projects` | ✓ | Add a project (validates by starting it and defaults `requires_auth` to `true`). `port: 0` or omitted registers a port-less **task** |
 | DELETE | `/api/projects/{name}` | ✓ | Remove a project from the registry |
 | GET | `/api/projects/dirs` | ✓ | List available unregistered directories |
 | GET | `/api/projects/{name}/files` | ✓ | List eligible start files in a directory |
@@ -171,8 +174,8 @@ All protected endpoints require the `X-Rover-Secret: <token>` header, where `<to
 | POST | `/api/projects/{name}/adopt` | ✓ | Adopt a process already listening on the project's port |
 | GET | `/api/projects/{name}/stream` | ✓ | SSE live console output (`ready`, `exit`, `proxy` lifecycle events) |
 | PUT | `/api/projects/{name}/proxy` | ✓ | Toggle reverse proxy on/off for a project (applies on next start) |
-| GET | `/api/proxy-cookie` | ✓ | Set the signed proxy-auth cookie for this browser |
-| | `http://<rover-addr>:<proxy-port>/` | * | Per-project reverse-proxy listener on a stable dedicated port; gated by the rover cookie when `--proxy-auth` is on |
+| GET | `/api/proxy-cookie` | ✓ | Mint the purpose-separated proxy-auth cookie for this browser |
+| | `http://<rover-addr>:<proxy-port>/` | * | Per-project reverse-proxy listener on a stable dedicated port; gated when `requires_auth` is true or global `--proxy-auth` is on |
 
 ---
 
@@ -215,24 +218,56 @@ See [SECURITY.md](SECURITY.md) for the full threat model and responsible disclos
 ### What the rover password protects — and what it doesn't
 
 The secret gates **control**: every `/api/*` endpoint (exec, project start/stop/add,
-config). It does **not**, by itself, gate the **data** your proxied apps serve — each
-proxied project listens on its own port. Two mechanisms cover that gap:
+config). A separate, purpose-scoped browser credential gates project proxy traffic;
+it is never accepted by the control API. Three mechanisms protect proxied data:
 
 1. **Proxies bind rover's own interface** (the host part of `--addr`), so a proxy is
    never reachable from a network rover itself is not.
-2. **`--proxy-auth`** additionally requires the rover login (via a signed HttpOnly
-   cookie) before a proxy forwards anything. `auto` (the default) resolves to **off**
-   on loopback and Tailscale (100.64.0.0/10) binds — there the network layer already
-   authenticates devices — and **on** for any other bind (LAN, `0.0.0.0`). Unauthenticated
-   browsers are redirected to rover's login once per 24 h; API clients can call
-   `GET /api/proxy-cookie`.
+2. **`requires_auth`** is stored per project. New registrations default to `true`,
+   and that project's proxy always requires the scoped HttpOnly cookie. Existing
+   registry entries without the field retain their previous false value.
+3. **`--proxy-auth`** is an additive global gate. `auto` resolves to **off** on
+   loopback and Tailscale (100.64.0.0/10) binds and **on** for LAN/all-interface
+   binds; `on` gates every project regardless of its per-project flag.
+
+Before forwarding, rover removes the `rover_proxy` cookie, `Origin`, client-supplied
+forwarding/IP headers, and every inbound `X-Rover-*` header. It then adds one
+`X-Rover-Proxy` proof in this form:
+
+`v1.<unix_nanoseconds>.<hex_hmac_sha256>`
+
+Rover first derives a project-scoped verifier value by HMACing the registry project
+name under the master secret with context `rover-proxy-verifier-key-v1`. The value
+is the lowercase hex digest, and its ASCII bytes key the request HMAC. That HMAC
+covers context `rover-proxy-request-v1`, the
+timestamp, loopback backend authority (`127.0.0.1:<port>`), HTTP method, and exact
+request URI (escaped path plus raw query), separated by NUL bytes. A launched,
+proxy-enabled project receives only its own derived value as `ROVER_PROXY_VERIFY`;
+an inherited value with that name is removed first. It cannot authenticate rover's
+control API, recover the master secret, or validate another project's proof.
+
+A downstream verifier must check the HMAC in constant time, enforce the 30-second
+clock window, and atomically reject a proof it has already accepted during that
+window. `auth.NewProxyRequestVerifier` provides a bounded, concurrency-safe verifier
+for Go backends. Rover guarantees a unique timestamp per request, including
+concurrent requests. Target and project binding prevent cross-project reuse;
+freshness plus a long-lived verifier instance prevent same-process replay. Multiple
+backend workers must share replay state if they need replay protection across
+workers, and a restarted verifier cannot remember pre-restart proofs. Because HMAC
+is symmetric, a backend can mint proofs for itself with its scoped value, but not
+for another project or the rover API.
+
+Rover never emits an authenticated proof without a non-empty master secret, and a
+`requires_auth` proxy refuses to start without one. Adopted processes do not receive
+an environment update; their verifier material, if required, must be provisioned by
+an explicitly approved out-of-band mechanism rather than by exposing `ROVER_SECRET`.
 
 ### Deployment shapes
 
 | Bind (`--addr`) | Who can reach rover & proxies | Guidance |
 |---|---|---|
-| `127.0.0.1:2278` | this machine only | secret optional, proxy auth pointless (auto=off) |
-| `<tailscale-ip>:2278` | your tailnet devices | **recommended for phone→PC**; secret required, proxy auth auto=off (WireGuard device auth is the boundary) |
+| `127.0.0.1:2278` | this machine only | secret optional; global auto=off, but `requires_auth` still applies |
+| `<tailscale-ip>:2278` | your tailnet devices | **recommended for phone→PC**; secret required; global auto=off, while protected projects remain gated |
 | `:2278` / LAN IP | everyone on every network you join | secret required; proxy auth auto=**on**; rover warns loudly if you force it off |
 
 ### Other rules that always hold
@@ -249,8 +284,12 @@ proxied project listens on its own port. Two mechanisms cover that gap:
   moment the tracked process exits, so it can never forward tailnet traffic to a
   stranger process that later grabs the port.
 - A **direct** (non-proxy) link is advertised only after rover verified the app's
-  socket on its own interface by dialing it — and **never while `--proxy-auth` is
-  on**: the UI will not present an unauthenticated path around a gate you enabled.
+  socket on its own interface by dialing it — and never while global proxy auth or
+  that project's `requires_auth` is on.
+- User commands, validation probes, tasks, and launched projects inherit ordinary
+  environment settings but not `ROVER_SECRET` or names ending in `_SECRET`, `_TOKEN`,
+  or `_KEY`. Rover removes any inherited `ROVER_PROXY_VERIFY`; only a launched,
+  proxy-enabled project receives a newly derived project-scoped value.
 - Enable TLS if traffic crosses an untrusted network; rotate the secret periodically
   (existing tokens and proxy cookies become invalid immediately).
 
@@ -308,7 +347,7 @@ and if the registered port is occupied you choose between **Adopt** (attach to t
 process already serving there), **Kill & start** (executed only after you confirm the
 exact PID), or a one-off alternative port.
 
-Each project in the registry includes a `proxy_enabled` field (default `true`). When enabled, Rover allocates a dedicated listener that reverse-proxies to the project's local port. **The proxy binds to the same interface Rover itself listens on** (the host portion of `--addr`), so a proxied app is never reachable from a network Rover is not — bind Rover to your Tailscale IP and the proxies follow. The proxy port is **allocated once and persisted** (`proxy_port` in the registry), so the proxy URL survives restarts and can be bookmarked on your phone. The proxy only forwards while the tracked process is alive, and can require the rover login (`--proxy-auth`). The proxy URL is shown in the dashboard next to the running project, with the hostname rewritten to whatever host your browser used to reach rover — so the link works from the tailnet, the LAN, or localhost alike.
+Each project in the registry includes `proxy_enabled` (default `true`) and can include `requires_auth`. New registrations set `requires_auth: true`; an older entry with no field retains false unless the operator opts it in. When the proxy is enabled, Rover allocates a dedicated listener that reverse-proxies to the project's local port. **The proxy binds to the same interface Rover itself listens on** (the host portion of `--addr`), so a proxied app is never reachable from a network Rover is not — bind Rover to your Tailscale IP and the proxies follow. The proxy port is **allocated once and persisted** (`proxy_port` in the registry), so the proxy URL survives restarts and can be bookmarked on your phone. The proxy only forwards while the tracked process is alive; `requires_auth` gates that project, while `--proxy-auth on` gates all projects. The proxy URL is shown in the dashboard next to the running project, with the hostname rewritten to whatever host your browser used to reach rover — so the link works from the tailnet, the LAN, or localhost alike.
 
 **Supported extensions:** `.py` `.sh` `.bat` `.ps1` `.js` `.ts` `.go` `.rb` `.php` `.pl` `.lua`
 
@@ -322,7 +361,7 @@ card can show up to three address elements:
 | Element | Looks like | When it appears | Where it works |
 |---|---|---|---|
 | **Proxy link** | ⎐ `http://<rover-host>:<proxy-port>` (green) | project is proxy-enabled and speaks HTTP | **anywhere rover itself is reachable** — phone, laptop, any device. This is the link to bookmark on your phone. |
-| **Direct link** | ↗ `http://<rover-host>:<app-port>` (blue) | only after rover **dialed the app's socket on its own interface and got a connection** — i.e. the app genuinely binds `0.0.0.0` or rover's interface, not just loopback. Never shown while `--proxy-auth` is on (it would silently bypass the login gate). | any device that can reach rover's interface |
+| **Direct link** | ↗ `http://<rover-host>:<app-port>` (blue) | only after rover **dialed the app's socket on its own interface and got a connection** — i.e. the app genuinely binds `0.0.0.0` or rover's interface, not just loopback. Never shown while global or per-project proxy auth is on. | any device that can reach rover's interface |
 | **Local address** | ⌂ `http://127.0.0.1:<port>` | the app binds (or reports) loopback only | **clickable only when your browser runs on the rover host itself.** On any other device it renders as inert grey text marked *(host only)* — tapping it there would hit *that device's own* loopback and fail. |
 
 **How rover tells the host apart from your phone:** not by the URL — the host
@@ -423,7 +462,7 @@ Details worth knowing:
 ## FAQ
 
 **Q: Does Rover store my secret anywhere?**  
-A: No. The raw secret never leaves the server. The browser stores only the signed 24-hour token in `sessionStorage` (cleared when the tab closes).
+A: No. The raw secret never leaves the server. The browser stores the signed 24-hour control token in `sessionStorage` and receives a distinct HttpOnly proxy cookie. User commands and launched projects do not inherit the raw secret; a launched proxy may receive only a one-way, project-scoped `ROVER_PROXY_VERIFY` value.
 
 **Q: Are sessions saved across restarts?**  
 A: Yes — completed sessions are persisted to `sessions.json` next to the binary. Running sessions are lost on restart.

@@ -5,12 +5,43 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ylnhari/rover/internal/auth"
 )
+
+var testSensitiveEnvironmentNames = []string{
+	"ROVER_SECRET",
+	"ROVER_PROXY_VERIFY",
+	"ROVER_TEST_CHILD_SECRET",
+	"ROVER_TEST_CHILD_TOKEN",
+	"ROVER_TEST_CHILD_KEY",
+}
+
+const (
+	testScopedProxyMaster  = "test-only-scoped-proxy-master"
+	testScopedProxyProject = "scoped-proxy-child"
+)
+
+func requireCleanChildEnvironment(t *testing.T) {
+	t.Helper()
+	if os.Getenv("ROVER_TEST_ASSERT_CLEAN_ENV") != "1" {
+		return
+	}
+	for _, name := range testSensitiveEnvironmentNames {
+		if _, ok := os.LookupEnv(name); ok {
+			t.Fatalf("sensitive environment variable %s reached child", name)
+		}
+	}
+}
 
 // TestHelperHTTPServer is not a real test: it is re-executed as a child
 // process by tests that need a genuine HTTP server for the validation probe.
@@ -19,6 +50,7 @@ func TestHelperHTTPServer(t *testing.T) {
 	if os.Getenv("ROVER_TEST_HELPER") != "1" {
 		t.Skip("helper process only")
 	}
+	requireCleanChildEnvironment(t)
 	port := os.Getenv("PORT")
 	if port == "" {
 		t.Fatal("PORT not set")
@@ -40,6 +72,79 @@ func TestHelperHTTPServer(t *testing.T) {
 // the PORT env var instead.
 func helperServerCmd() string {
 	return os.Args[0] + " -test.run=^TestHelperHTTPServer$ -test.skip=p{port}"
+}
+
+func TestHelperOneShotHTTPServer(t *testing.T) {
+	if os.Getenv("ROVER_TEST_ONE_SHOT_HTTP_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	requireCleanChildEnvironment(t)
+	port := os.Getenv("PORT")
+	if port == "" {
+		t.Fatal("PORT not set")
+	}
+	var srv http.Server
+	srv.Addr = "127.0.0.1:" + port
+	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "helper ok")
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			srv.Close()
+		}()
+	})
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		t.Fatal(err)
+	}
+}
+
+func helperOneShotHTTPServerCmd() string {
+	return os.Args[0] + " -test.run=^TestHelperOneShotHTTPServer$ -test.skip=p{port}"
+}
+
+func TestHelperScopedProxyServer(t *testing.T) {
+	if os.Getenv("ROVER_TEST_SCOPED_PROXY_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	if _, ok := os.LookupEnv("ROVER_SECRET"); ok {
+		t.Fatal("ROVER_SECRET reached scoped proxy child")
+	}
+	proofKey := os.Getenv("ROVER_PROXY_VERIFY")
+	if proofKey == "" || proofKey == "untrusted-parent-value" || proofKey != auth.DeriveProxyRequestKey(testScopedProxyMaster, testScopedProxyProject) {
+		t.Fatal("scoped proxy child received the wrong verifier value")
+	}
+	port := os.Getenv("PORT")
+	if port == "" {
+		t.Fatal("PORT not set")
+	}
+	audience := "127.0.0.1:" + port
+	verifier := auth.NewProxyRequestVerifier()
+	var srv http.Server
+	srv.Addr = audience
+	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proof := r.Header.Get("X-Rover-Proxy")
+		if proof == "" {
+			// Readiness probe: the authenticated proxy is not in this path yet.
+			fmt.Fprint(w, "ready")
+			return
+		}
+		if err := verifier.Verify(proofKey, proof, audience, r.Method, r.URL.RequestURI()); err != nil {
+			http.Error(w, "invalid proxy proof", http.StatusUnauthorized)
+		} else {
+			w.Header().Set("X-Test-Proxy-Proof-Valid", "1")
+			fmt.Fprint(w, "verified")
+		}
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			srv.Close()
+		}()
+	})
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		t.Fatal(err)
+	}
+}
+
+func helperScopedProxyServerCmd() string {
+	return os.Args[0] + " -test.run=^TestHelperScopedProxyServer$ -test.skip=p{port}"
 }
 
 // TestHelperRawTCPServer accepts TCP connections but never answers, so the
@@ -71,6 +176,17 @@ func TestHelperRawTCPServer(t *testing.T) {
 
 func helperRawTCPCmd() string {
 	return os.Args[0] + " -test.run=^TestHelperRawTCPServer$ -test.skip=p{port}"
+}
+
+func TestHelperCleanEnvironment(t *testing.T) {
+	if os.Getenv("ROVER_TEST_ENV_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	requireCleanChildEnvironment(t)
+}
+
+func helperCleanEnvironmentCmd() string {
+	return os.Args[0] + " -test.run=^TestHelperCleanEnvironment$"
 }
 
 func freeTCPPort(t *testing.T) int {
@@ -224,7 +340,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "registry.json")
 
 	orig := roverRegistry{Projects: map[string]ProjectInfo{
-		"app": {Name: "app", Path: dir, Port: 1234, StartCmd: "python app.py", URL: "http://127.0.0.1:1234", Description: "Active", ProxyPort: 45678},
+		"app": {Name: "app", Path: dir, Port: 1234, StartCmd: "python app.py", URL: "http://127.0.0.1:1234", Description: "Active", ProxyPort: 45678, RequiresAuth: true},
 	}}
 	if err := saveRoverRegistry(path, orig); err != nil {
 		t.Fatal(err)
@@ -235,7 +351,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("loaded %d projects; want 1", len(loaded.Projects))
 	}
 	p := loaded.Projects["app"]
-	if p.Port != 1234 || p.StartCmd != "python app.py" || p.ProxyPort != 45678 {
+	if p.Port != 1234 || p.StartCmd != "python app.py" || p.ProxyPort != 45678 || !p.RequiresAuth {
 		t.Errorf("unexpected project data: %+v", p)
 	}
 	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
@@ -257,8 +373,22 @@ func TestLoadRegistryNonexistent(t *testing.T) {
 	}
 }
 
+func TestLegacyProjectKeepsRequiresAuthFalse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	data := []byte(`{"projects":{"legacy":{"name":"legacy","path":".","port":8080,"start_cmd":"echo ok","proxy_enabled":true}}}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	project := loadRoverRegistry(path).Projects["legacy"]
+	if project.RequiresAuth {
+		t.Fatal("legacy project without requires_auth was silently changed")
+	}
+}
+
 func TestAddProject(t *testing.T) {
-	t.Setenv("ROVER_TEST_HELPER", "1")
+	t.Setenv("ROVER_TEST_ONE_SHOT_HTTP_HELPER", "1")
 	dir := t.TempDir()
 	m := NewManager(dir)
 	m.registryPath = filepath.Join(dir, "registry.json")
@@ -275,7 +405,7 @@ func TestAddProject(t *testing.T) {
 	os.MkdirAll(appDir, 0755)
 	port := freeTCPPort(t)
 
-	proj, report, err := m.AddProject("testapp", helperServerCmd(), port)
+	proj, report, err := m.AddProject("testapp", helperOneShotHTTPServerCmd(), port)
 	if err != nil {
 		t.Fatalf("AddProject failed: %v", err)
 	}
@@ -294,6 +424,145 @@ func TestAddProject(t *testing.T) {
 	}
 	if !report.Probe.HTTP || report.Probe.Status == 0 {
 		t.Errorf("expected HTTP-classified probe, got %+v", report.Probe)
+	}
+	if !proj.RequiresAuth {
+		t.Error("new projects must require proxy authentication by default")
+	}
+}
+
+func TestProjectChildrenDoNotInheritSecrets(t *testing.T) {
+	t.Setenv("ROVER_TEST_ENV_HELPER", "1")
+	t.Setenv("ROVER_TEST_ONE_SHOT_HTTP_HELPER", "1")
+	t.Setenv("ROVER_TEST_ASSERT_CLEAN_ENV", "1")
+	t.Setenv("ROVER_SECRET", "test-only")
+	t.Setenv("ROVER_PROXY_VERIFY", "untrusted-parent-value")
+	t.Setenv("ROVER_TEST_CHILD_SECRET", "test-only")
+	t.Setenv("ROVER_TEST_CHILD_TOKEN", "test-only")
+	t.Setenv("ROVER_TEST_CHILD_KEY", "test-only")
+
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	m.SetProbeTimeout(15 * time.Second)
+
+	appDir := filepath.Join(dir, "cleanenv")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	validationPort := freeTCPPort(t)
+	if _, err := m.ValidateProject(appDir, composeStartCmd(helperOneShotHTTPServerCmd(), validationPort), validationPort); err != nil {
+		t.Fatalf("validation child inherited a sensitive variable: %v", err)
+	}
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"cleanenv": {
+			Name:         "cleanenv",
+			Path:         appDir,
+			StartCmd:     helperCleanEnvironmentCmd(),
+			Kind:         KindTask,
+			ProxyEnabled: false,
+			RequiresAuth: true,
+		},
+	}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start("cleanenv", StartOptions{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for m.LastExit("cleanenv") == nil && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if exit := m.LastExit("cleanenv"); exit == nil || exit.Code != 0 {
+		t.Fatalf("launched child did not exit cleanly: %+v", exit)
+	}
+
+	if _, err := m.ValidateTask(appDir, helperCleanEnvironmentCmd()); err != nil {
+		t.Fatalf("task validation child inherited a sensitive variable: %v", err)
+	}
+}
+
+func TestProxyChildReceivesMatchingScopedVerifier(t *testing.T) {
+	t.Setenv("ROVER_TEST_SCOPED_PROXY_HELPER", "1")
+	t.Setenv("ROVER_SECRET", testScopedProxyMaster)
+	t.Setenv("ROVER_PROXY_VERIFY", "untrusted-parent-value")
+
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	m.SetBindHost("127.0.0.1")
+	m.SetProxyAuth(false, testScopedProxyMaster, "2278", false)
+	m.SetProbeTimeout(15 * time.Second)
+	port := freeTCPPort(t)
+	appDir := filepath.Join(dir, testScopedProxyProject)
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		testScopedProxyProject: {
+			Name:         testScopedProxyProject,
+			Path:         appDir,
+			StartCmd:     helperScopedProxyServerCmd(),
+			Port:         port,
+			Kind:         KindWeb,
+			ProxyEnabled: true,
+			RequiresAuth: true,
+		},
+	}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(testScopedProxyProject, StartOptions{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer m.Stop(testScopedProxyProject)
+
+	var proxyURL string
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if running := m.GetRunning(testScopedProxyProject); running != nil {
+			proxyURL = running.ProxyURL
+			if running.State == StateRunning && proxyURL != "" {
+				break
+			}
+		}
+		if exit := m.LastExit(testScopedProxyProject); exit != nil {
+			t.Fatalf("scoped proxy child exited before readiness: %+v", exit)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if proxyURL == "" {
+		t.Fatal("scoped proxy URL was not published")
+	}
+	proxyToken, err := auth.IssueProxyToken(testScopedProxyMaster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localProxyURL, err := url.Parse(proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localProxyURL.Host = net.JoinHostPort("127.0.0.1", localProxyURL.Port())
+	req, err := http.NewRequest(http.MethodGet, localProxyURL.String()+"/cards?view=full", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: "rover_proxy", Value: proxyToken})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxied request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Test-Proxy-Proof-Valid") != "1" {
+		t.Fatalf("child did not validate proxy proof: status=%d marker=%q", resp.StatusCode, resp.Header.Get("X-Test-Proxy-Proof-Valid"))
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
+	for m.LastExit(testScopedProxyProject) == nil && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if exit := m.LastExit(testScopedProxyProject); exit == nil || exit.Code != 0 {
+		t.Fatalf("scoped proxy child did not exit cleanly: %+v", exit)
 	}
 }
 
@@ -994,7 +1263,7 @@ func TestVerifyDirectURL(t *testing.T) {
 	m := NewManager(t.TempDir())
 	m.SetBindHost("127.0.0.1")
 
-	if got := m.verifyDirectURL(0); got != "" {
+	if got := m.verifyDirectURL(0, false); got != "" {
 		t.Errorf("no port: want empty, got %q", got)
 	}
 
@@ -1010,7 +1279,7 @@ func TestVerifyDirectURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lb.Close()
-	if got := m.verifyDirectURL(lb.Addr().(*net.TCPAddr).Port); got != "" {
+	if got := m.verifyDirectURL(lb.Addr().(*net.TCPAddr).Port, false); got != "" {
 		t.Errorf("loopback-only listener: want empty, got %q", got)
 	}
 
@@ -1023,14 +1292,17 @@ func TestVerifyDirectURL(t *testing.T) {
 	defer all.Close()
 	allPort := all.Addr().(*net.TCPAddr).Port
 	want := fmt.Sprintf("http://%s:%d", ip, allPort)
-	if got := m.verifyDirectURL(allPort); got != want {
+	if got := m.verifyDirectURL(allPort, false); got != want {
 		t.Errorf("all-interfaces listener: want %q, got %q", want, got)
+	}
+	if got := m.verifyDirectURL(allPort, true); got != "" {
+		t.Errorf("requires_auth project: want empty, got %q", got)
 	}
 
 	// With proxy auth on, a direct link would silently bypass the auth gate,
 	// so it is never advertised even when reachable.
 	m.SetProxyAuth(true, "secret", "2278", false)
-	if got := m.verifyDirectURL(allPort); got != "" {
+	if got := m.verifyDirectURL(allPort, false); got != "" {
 		t.Errorf("proxy auth on: want empty, got %q", got)
 	}
 }
@@ -1320,21 +1592,110 @@ func TestUpdateProjectPort(t *testing.T) {
 	}
 }
 
+func TestRequiredAuthProxyRefusesMissingOrWrongCredential(t *testing.T) {
+	var backendHits atomic.Int32
+	backend := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits.Add(1)
+		fmt.Fprint(w, "ok")
+	})}
+	bln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bln.Close()
+	backendPort := bln.Addr().(*net.TCPAddr).Port
+	go backend.Serve(bln)
+	defer backend.Close()
+
+	const secret = "test-only-proxy-secret"
+	proofKey := auth.DeriveProxyRequestKey(secret, "required-auth-test")
+	m := NewManager(t.TempDir())
+	m.SetBindHost("127.0.0.1")
+	// The global gate is deliberately off. requires_auth must still enforce the
+	// cookie gate for this project.
+	m.SetProxyAuth(false, secret, "2278", false)
+	rp := &runningProcess{done: make(chan struct{})}
+	pln, srv, pport, err := m.startProxy(rp, backendPort, 0, true, proofKey)
+	if err != nil {
+		t.Fatalf("startProxy: %v", err)
+	}
+	defer srv.Close()
+	defer pln.Close()
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d/", pport)
+	do := func(cookieValue string) int {
+		t.Helper()
+		req, reqErr := http.NewRequest(http.MethodGet, proxyURL, nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		if cookieValue != "" {
+			req.AddCookie(&http.Cookie{Name: "rover_proxy", Value: cookieValue})
+		}
+		resp, reqErr := client.Do(req)
+		if reqErr != nil {
+			t.Fatalf("proxy request: %v", reqErr)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := do(""); got != http.StatusFound {
+		t.Fatalf("missing cookie status = %d; want 302", got)
+	}
+	controlToken, err := auth.IssueToken(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := do(controlToken); got != http.StatusFound {
+		t.Fatalf("control token cookie status = %d; want 302", got)
+	}
+	if got := backendHits.Load(); got != 0 {
+		t.Fatalf("unauthenticated requests reached backend %d times", got)
+	}
+
+	proxyToken, err := auth.IssueProxyToken(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := do(proxyToken); got != http.StatusOK {
+		t.Fatalf("proxy credential status = %d; want 200", got)
+	}
+	if got := backendHits.Load(); got != 1 {
+		t.Fatalf("authenticated request reached backend %d times; want 1", got)
+	}
+}
+
+func TestRequiredAuthProxyFailsClosedWithoutSecret(t *testing.T) {
+	m := NewManager(t.TempDir())
+	m.SetBindHost("127.0.0.1")
+	rp := &runningProcess{done: make(chan struct{})}
+	ln, srv, port, err := m.startProxy(rp, 8080, 0, true, "")
+	if err == nil || !strings.Contains(err.Error(), "requires_auth") {
+		t.Fatalf("startProxy error = %v; want requires_auth failure", err)
+	}
+	if ln != nil || srv != nil || port != 0 {
+		t.Fatalf("failed-closed proxy allocated resources: listener=%v server=%v port=%d", ln, srv, port)
+	}
+}
+
 func TestProxyPresentsLoopbackRequest(t *testing.T) {
-	// The proxy must make a request look, to the loopback backend, like a local
-	// client made it directly: upstream Host rewritten to the loopback target
-	// (so trusted-host guards accept it), no X-Forwarded-For (so servers that
-	// honor it don't see the request as remote and disable loopback-only paths),
-	// and the real external host preserved in X-Forwarded-Host. See
-	// transparentRewrite for the full rationale.
-	type captured struct{ host, xff, xfh, xfproto string }
-	seen := make(chan captured, 1)
+	// The proxy presents a loopback Host while stripping every client-supplied
+	// identity/proxy assertion. It keeps ordinary application cookies, removes
+	// rover's own cookie, and replaces spoofed X-Rover-* headers with one fresh,
+	// request-bound proof.
+	type captured struct {
+		host   string
+		header http.Header
+	}
+	seen := make(chan captured, 2)
 	backend := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen <- captured{
-			host:    r.Host,
-			xff:     r.Header.Get("X-Forwarded-For"),
-			xfh:     r.Header.Get("X-Forwarded-Host"),
-			xfproto: r.Header.Get("X-Forwarded-Proto"),
+			host:   r.Host,
+			header: r.Header.Clone(),
 		}
 		fmt.Fprint(w, "ok")
 	})}
@@ -1347,37 +1708,141 @@ func TestProxyPresentsLoopbackRequest(t *testing.T) {
 	go backend.Serve(bln)
 	defer backend.Close()
 
+	const secret = "test-only-proxy-secret"
+	proofKey := auth.DeriveProxyRequestKey(secret, "proxy-rewrite-test")
 	m := NewManager(t.TempDir())
 	m.SetBindHost("127.0.0.1")
+	m.SetProxyAuth(false, secret, "2278", false)
 	rp := &runningProcess{done: make(chan struct{})}
-	pln, srv, pport, err := m.startProxy(rp, backendPort, 0)
+	pln, srv, pport, err := m.startProxy(rp, backendPort, 0, false, proofKey)
 	if err != nil {
 		t.Fatalf("startProxy: %v", err)
 	}
 	defer srv.Close()
 	defer pln.Close()
 
-	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", pport), nil)
-	req.Host = "phone.example.ts.net:20128"          // external host a phone would send
-	req.Header.Set("X-Forwarded-For", "203.0.113.9") // a value the client tried to spoof
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request: %v", err)
+	requestURI := "/cards?view=full"
+	do := func() captured {
+		t.Helper()
+		req, reqErr := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", pport, requestURI), nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		req.Host = "phone.example.ts.net:20128"
+		for name, value := range map[string]string{
+			"X-Forwarded-For":   "203.0.113.9",
+			"X-Forwarded-Host":  "attacker.invalid",
+			"X-Forwarded-Proto": "ftp",
+			"Forwarded":         "for=203.0.113.9",
+			"X-Real-IP":         "203.0.113.9",
+			"X-Client-IP":       "203.0.113.9",
+			"True-Client-IP":    "203.0.113.9",
+			"CF-Connecting-IP":  "203.0.113.9",
+			"Origin":            "https://attacker.invalid",
+			"X-Rover-Secret":    "attacker",
+			"X-Rover-Extra":     "attacker",
+			"X-Rover-Proxy":     "attacker",
+		} {
+			req.Header.Set(name, value)
+		}
+		req.Header.Set("Cookie", "rover_proxy=must-not-leak; app_session=kept")
+		resp, reqErr := http.DefaultClient.Do(req)
+		if reqErr != nil {
+			t.Fatalf("request: %v", reqErr)
+		}
+		resp.Body.Close()
+		return <-seen
 	}
-	resp.Body.Close()
 
-	got := <-seen
-	if want := fmt.Sprintf("127.0.0.1:%d", backendPort); got.host != want {
-		t.Errorf("upstream Host = %q, want loopback target %q", got.host, want)
+	first := do()
+	second := do()
+	verifier := auth.NewProxyRequestVerifier()
+	for i, got := range []captured{first, second} {
+		if want := fmt.Sprintf("127.0.0.1:%d", backendPort); got.host != want {
+			t.Errorf("request %d upstream Host = %q, want loopback target %q", i+1, got.host, want)
+		}
+		for _, name := range []string{
+			"X-Forwarded-For", "Forwarded", "X-Real-IP", "X-Client-IP",
+			"True-Client-IP", "CF-Connecting-IP", "Origin", "X-Rover-Secret", "X-Rover-Extra",
+		} {
+			if value := got.header.Get(name); value != "" {
+				t.Errorf("request %d client-supplied %s reached backend = %q", i+1, name, value)
+			}
+		}
+		if value := got.header.Get("X-Forwarded-Host"); value != "phone.example.ts.net:20128" {
+			t.Errorf("request %d X-Forwarded-Host = %q; want original external host", i+1, value)
+		}
+		if value := got.header.Get("X-Forwarded-Proto"); value != "http" {
+			t.Errorf("request %d X-Forwarded-Proto = %q; want http", i+1, value)
+		}
+		cookie := got.header.Get("Cookie")
+		if strings.Contains(cookie, "rover_proxy=") {
+			t.Errorf("request %d rover_proxy cookie reached backend: %q", i+1, cookie)
+		}
+		if !strings.Contains(cookie, "app_session=kept") {
+			t.Errorf("request %d application cookie was not preserved: %q", i+1, cookie)
+		}
+		proof := got.header.Get("X-Rover-Proxy")
+		if proof == "" || proof == "attacker" {
+			t.Fatalf("request %d missing rover-generated proxy proof: %q", i+1, proof)
+		}
+		if err := verifier.Verify(proofKey, proof, fmt.Sprintf("127.0.0.1:%d", backendPort), http.MethodGet, requestURI); err != nil {
+			t.Errorf("request %d invalid proxy proof: %v", i+1, err)
+		}
 	}
-	if got.xff != "" {
-		t.Errorf("X-Forwarded-For reached backend = %q, want empty (no client identity leaked)", got.xff)
+	if first.header.Get("X-Rover-Proxy") == second.header.Get("X-Rover-Proxy") {
+		t.Fatal("two proxied requests received the same X-Rover-Proxy proof")
 	}
-	if got.xfh != "phone.example.ts.net:20128" {
-		t.Errorf("X-Forwarded-Host = %q, want the original external host", got.xfh)
+}
+
+func TestTransparentRewriteStripsSensitiveTrailers(t *testing.T) {
+	in := httptest.NewRequest(http.MethodPost, "http://phone.example.ts.net:55038/cards?view=full", strings.NewReader("body"))
+	out := in.Clone(in.Context())
+	out.Trailer = http.Header{
+		"X-Rover-Proxy":   {"attacker"},
+		"X-Rover-Extra":   {"attacker"},
+		"X-Forwarded-For": {"203.0.113.9"},
+		"Origin":          {"https://attacker.invalid"},
+		"Cookie":          {"rover_proxy=must-not-leak; app_trailer=kept"},
 	}
-	if got.xfproto != "http" {
-		t.Errorf("X-Forwarded-Proto = %q, want http", got.xfproto)
+	target, err := url.Parse("http://127.0.0.1:8777")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proofKey := auth.DeriveProxyRequestKey("test-only-proxy-secret", "trailer-rewrite-test")
+	transparentRewrite(target, proofKey)(&httputil.ProxyRequest{In: in, Out: out})
+
+	for _, name := range []string{"X-Rover-Proxy", "X-Rover-Extra", "X-Forwarded-For", "Origin"} {
+		if value := out.Trailer.Get(name); value != "" {
+			t.Errorf("client-supplied %s trailer survived rewrite = %q", name, value)
+		}
+	}
+	trailerCookie := out.Trailer.Get("Cookie")
+	if strings.Contains(trailerCookie, "rover_proxy=") {
+		t.Fatalf("rover_proxy trailer cookie survived rewrite: %q", trailerCookie)
+	}
+	if !strings.Contains(trailerCookie, "app_trailer=kept") {
+		t.Fatalf("application trailer cookie was not preserved: %q", trailerCookie)
+	}
+	proof := out.Header.Get("X-Rover-Proxy")
+	if proof == "" || proof == "attacker" {
+		t.Fatalf("rewrite did not replace spoofed proof: %q", proof)
+	}
+}
+
+func TestTransparentRewriteOmitsProofWithoutVerifierKey(t *testing.T) {
+	in := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8777/cards", nil)
+	in.Header.Set("X-Rover-Proxy", "attacker")
+	out := in.Clone(in.Context())
+	target, err := url.Parse("http://127.0.0.1:8777")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transparentRewrite(target, "")(&httputil.ProxyRequest{In: in, Out: out})
+	if proof := out.Header.Get("X-Rover-Proxy"); proof != "" {
+		t.Fatalf("secret-less rewrite emitted an untrusted proxy proof: %q", proof)
 	}
 }
 

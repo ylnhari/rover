@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/ylnhari/rover/internal/auth"
+	"github.com/ylnhari/rover/internal/childenv"
 )
 
 // ErrPortInUse is returned by Start when the requested port is already taken by
@@ -99,6 +100,10 @@ type ProjectInfo struct {
 	Description  string `json:"description,omitempty"`
 	Kind         string `json:"kind,omitempty"`
 	ProxyEnabled bool   `json:"proxy_enabled"`
+	// RequiresAuth opts this project into the proxy cookie gate even when the
+	// server-wide --proxy-auth mode resolves off. It is omitted for legacy
+	// false entries so loading/saving does not silently rewrite their policy.
+	RequiresAuth bool `json:"requires_auth,omitempty"`
 	// ProxyPort is the stable, persisted port the reverse proxy listens on, so
 	// bookmarks survive restarts. 0 = not yet allocated (assigned on first
 	// proxied start).
@@ -232,9 +237,8 @@ type Manager struct {
 	// probeTimeout bounds how long registration validation and start-time
 	// readiness probes wait for the project to begin listening.
 	probeTimeout time.Duration
-	// Proxy auth gate: when proxyAuthOn, proxy requests must carry a valid
-	// signed rover cookie; unauthenticated browsers are redirected to rover's
-	// UI (roverScheme://host:roverPort) to log in.
+	// Global proxy auth gate. Per-project RequiresAuth is enforced in addition
+	// to this mode; unauthenticated browsers are redirected to rover's UI.
 	proxyAuthOn bool
 	proxySecret string
 	roverPort   string
@@ -285,11 +289,11 @@ func proxyURLHost(bindHost string) string {
 // direct URL only when something actually accepts connections there (i.e. the
 // app bound 0.0.0.0 or that interface, not just loopback). Returns "" when the
 // app is only reachable on the rover host, when rover has no non-loopback
-// interface to advertise, or when proxy auth is on — a direct link would be a
-// silent bypass of the auth gate the operator turned on, so it is never
-// advertised alongside the authenticated proxy link.
-func (m *Manager) verifyDirectURL(port int) string {
-	if m.proxyAuthOn || port <= 0 {
+// interface to advertise, or when global/per-project proxy auth is on — a
+// direct link would silently bypass the gate, so it is never advertised
+// alongside the authenticated proxy link.
+func (m *Manager) verifyDirectURL(port int, requiresAuth bool) string {
+	if m.proxyAuthOn || requiresAuth || port <= 0 {
 		return ""
 	}
 	host := proxyURLHost(m.bindHost)
@@ -340,10 +344,10 @@ func (m *Manager) SetProbeTimeout(d time.Duration) {
 	}
 }
 
-// SetProxyAuth configures the proxy authentication gate. When on, every proxy
-// request must carry a valid signed rover cookie; browsers without one are
-// redirected to rover's own UI (reached at roverPort on the same host) to log
-// in, which sets the cookie for the whole host.
+// SetProxyAuth configures the global proxy authentication gate and the secret
+// used by both global and per-project gates. When on, every proxy request must
+// carry a valid signed rover cookie; RequiresAuth enforces the same gate for an
+// individual project even when this global mode is off.
 func (m *Manager) SetProxyAuth(on bool, secret, roverPort string, roverTLS bool) {
 	m.proxyAuthOn = on && secret != ""
 	m.proxySecret = secret
@@ -351,11 +355,9 @@ func (m *Manager) SetProxyAuth(on bool, secret, roverPort string, roverTLS bool)
 	m.roverTLS = roverTLS
 }
 
-// transparentRewrite builds the ReverseProxy rewrite hook that makes a proxied
-// request indistinguishable, to the loopback backend, from one a local client
-// made directly. This is what lets rover be a *transparent* front door: a plain
-// loopback app is reached from off-host without the app needing to know it was
-// proxied or having to whitelist the external network.
+// transparentRewrite builds the ReverseProxy rewrite hook that presents the
+// request through the backend's loopback listener while adding an authenticated
+// X-Rover-Proxy proof for applications that need to distinguish rover traffic.
 //
 // It exists because the stock reverse proxy leaks the external client to the
 // backend in two ways, each of which a security-conscious loopback app acts on
@@ -384,7 +386,40 @@ func (m *Manager) SetProxyAuth(on bool, secret, roverPort string, roverTLS bool)
 // caller on its own, so rover becomes the sole authenticator for proxied apps.
 // That is already rover's role — it is the single authenticated front door, and
 // its proxies only bind to the interface rover itself is exposed on.
-func transparentRewrite(target *url.URL) func(*httputil.ProxyRequest) {
+func stripClientProxyHeaders(header http.Header) {
+	for name := range header {
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(lower, "x-rover-") || strings.HasPrefix(lower, "x-forwarded-") {
+			delete(header, name)
+			continue
+		}
+		switch lower {
+		case "forwarded", "x-real-ip", "x-client-ip", "true-client-ip", "cf-connecting-ip", "origin":
+			delete(header, name)
+		}
+	}
+}
+
+func stripCookieHeader(header http.Header, cookieName string) {
+	r := &http.Request{Header: header}
+	cookies := r.Cookies()
+	for name := range header {
+		if strings.EqualFold(name, "Cookie") {
+			delete(header, name)
+		}
+	}
+	for _, cookie := range cookies {
+		if cookie.Name != cookieName {
+			r.AddCookie(cookie)
+		}
+	}
+}
+
+func stripRequestCookie(r *http.Request, cookieName string) {
+	stripCookieHeader(r.Header, cookieName)
+}
+
+func transparentRewrite(target *url.URL, proofKey string) func(*httputil.ProxyRequest) {
 	return func(pr *httputil.ProxyRequest) {
 		origHost := pr.In.Host
 		scheme := "http"
@@ -394,20 +429,32 @@ func transparentRewrite(target *url.URL) func(*httputil.ProxyRequest) {
 		pr.SetURL(target)
 		// Present a genuine loopback request to the backend.
 		pr.Out.Host = target.Host
-		// Preserve the external origin for backends that build absolute URLs,
-		// but never leak the client IP.
+		// Remove every client-supplied forwarding/identity assertion before
+		// adding rover-owned values. Origin is intentionally removed: the
+		// external browser origin is not the loopback backend's trusted origin.
+		stripClientProxyHeaders(pr.Out.Header)
+		stripClientProxyHeaders(pr.Out.Trailer)
+		stripRequestCookie(pr.Out, "rover_proxy")
+		stripCookieHeader(pr.Out.Trailer, "rover_proxy")
+		// Preserve the external host/protocol for backends that deliberately
+		// build absolute URLs from trusted forwarding headers.
 		pr.Out.Header.Set("X-Forwarded-Host", origHost)
 		pr.Out.Header.Set("X-Forwarded-Proto", scheme)
-		pr.Out.Header.Del("X-Forwarded-For")
-		pr.Out.Header.Del("Forwarded")
+		if proofKey != "" {
+			proof := auth.IssueProxyRequestProof(proofKey, target.Host, pr.In.Method, pr.In.URL.RequestURI())
+			pr.Out.Header.Set("X-Rover-Proxy", proof)
+		}
 	}
 }
 
 // startProxy binds a reverse proxy for rp on the requested port (0 = ephemeral)
 // on rover's own interface. Requests are gated on the tracked process still
 // being alive — the proxy never forwards to a port whose owner has exited —
-// and, when proxy auth is on, on a valid signed rover cookie.
-func (m *Manager) startProxy(rp *runningProcess, targetPort, proxyPort int) (net.Listener, *http.Server, int, error) {
+// and, when global or per-project auth is on, on a valid scoped proxy cookie.
+func (m *Manager) startProxy(rp *runningProcess, targetPort, proxyPort int, requiresAuth bool, proofKey string) (net.Listener, *http.Server, int, error) {
+	if requiresAuth && m.proxySecret == "" {
+		return nil, nil, 0, fmt.Errorf("requires_auth proxy cannot start without a rover secret")
+	}
 	// Bind the proxy to the same interface rover listens on so it is never
 	// reachable from a network rover itself is not exposed to.
 	ln, err := net.Listen("tcp", net.JoinHostPort(m.bindHost, strconv.Itoa(proxyPort)))
@@ -417,16 +464,18 @@ func (m *Manager) startProxy(rp *runningProcess, targetPort, proxyPort int) (net
 	pport := ln.Addr().(*net.TCPAddr).Port
 
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", targetPort))
-	proxy := &httputil.ReverseProxy{Rewrite: transparentRewrite(target)}
+	proxy := &httputil.ReverseProxy{Rewrite: transparentRewrite(target, proofKey)}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rp.exited.Load() {
 			http.Error(w, "project is not running", http.StatusServiceUnavailable)
 			return
 		}
-		if m.proxyAuthOn {
+		// Per-project policy is additive: a requires_auth project is gated even
+		// when --proxy-auth auto/off makes the global gate false.
+		if requiresAuth || m.proxyAuthOn {
 			c, err := r.Cookie("rover_proxy")
-			if err != nil || auth.VerifyToken(m.proxySecret, c.Value) != nil {
+			if err != nil || auth.VerifyProxyToken(m.proxySecret, c.Value) != nil {
 				host := r.Host
 				if h, _, err := net.SplitHostPort(host); err == nil {
 					host = h
@@ -463,10 +512,14 @@ func (m *Manager) startProxyFor(name string, rp *runningProcess, proj ProjectInf
 	rp.outputMu.Lock()
 	targetPort := rp.info.Port
 	rp.outputMu.Unlock()
-	ln, srv, pport, err := m.startProxy(rp, targetPort, proj.ProxyPort)
+	proofKey := ""
+	if m.proxySecret != "" {
+		proofKey = auth.DeriveProxyRequestKey(m.proxySecret, name)
+	}
+	ln, srv, pport, err := m.startProxy(rp, targetPort, proj.ProxyPort, proj.RequiresAuth, proofKey)
 	if err != nil && proj.ProxyPort > 0 {
 		m.logf("launcher: proxy for %s: stable port %d unavailable (%v), falling back to an ephemeral port", name, proj.ProxyPort, err)
-		ln, srv, pport, err = m.startProxy(rp, rp.info.Port, 0)
+		ln, srv, pport, err = m.startProxy(rp, rp.info.Port, 0, proj.RequiresAuth, proofKey)
 	}
 	if err != nil {
 		m.logf("launcher: proxy for %s: %v", name, err)
@@ -619,14 +672,17 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 
 	setProcessGroup(cmd)
 
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
+	cmd.Env = childenv.Filter(os.Environ())
 	cmd.Env = append(cmd.Env,
 		"PYTHONUNBUFFERED=1",
 		"PYTHONIOENCODING=utf-8",
 		"PYTHONLEGACYWINDOWSSTDIO=utf-8",
 	)
+	if proj.ProxyEnabled && m.proxySecret != "" {
+		// This is a project-scoped verifier value, not ROVER_SECRET. Filtering
+		// first prevents a parent-provided value from overriding rover's value.
+		cmd.Env = append(cmd.Env, "ROVER_PROXY_VERIFY="+auth.DeriveProxyRequestKey(m.proxySecret, name))
+	}
 	if port > 0 {
 		cmd.Env = append(cmd.Env, "PORT="+strconv.Itoa(port))
 	}
@@ -721,7 +777,7 @@ func (m *Manager) confirmStarted(name string, rp *runningProcess, proj ProjectIn
 
 	// Dial the port on rover's advertised interface (outside the lock) so the
 	// direct link reflects the actual socket, not a guess from log text.
-	direct := m.verifyDirectURL(port)
+	direct := m.verifyDirectURL(port, proj.RequiresAuth)
 
 	rp.outputMu.Lock()
 	rp.info.State = StateRunning
@@ -901,7 +957,7 @@ func (m *Manager) Adopt(name string) (*RunningProject, error) {
 			StartTime: time.Now(),
 			Port:      proj.Port,
 			URL:       fmt.Sprintf("http://127.0.0.1:%d", proj.Port),
-			DirectURL: m.verifyDirectURL(proj.Port),
+			DirectURL: m.verifyDirectURL(proj.Port, proj.RequiresAuth),
 			State:     StateAdopted,
 			PID:       pid,
 		},
@@ -1242,6 +1298,7 @@ func (m *Manager) AddProject(name, startCmd string, port int) (*ProjectInfo, *Va
 		URL:          url,
 		Kind:         kind,
 		ProxyEnabled: port > 0,
+		RequiresAuth: true,
 	}
 
 	// Validation ran unlocked (it can take up to the probe timeout), so

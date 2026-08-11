@@ -54,7 +54,8 @@ func TestResolveProxyAuth(t *testing.T) {
 		{"on", "192.168.1.10", "", false, true}, // on requires a secret
 		{"off", "192.168.1.10", "s", false, false},
 		{"auto", "127.0.0.1", "s", false, false},     // loopback: network is trusted
-		{"auto", "100.100.20.30", "s", false, false}, // tailnet: WireGuard is the boundary
+		{"auto", "100.100.20.30", "s", true, false},  // tailnet: reachable by other devices, gate on
+		{"auto", "100.100.20.30", "", false, false}, // no secret: cannot gate, so cannot claim to
 		{"auto", "192.168.1.10", "s", true, false},   // LAN: gate on
 		{"auto", "", "s", true, false},               // all interfaces: gate on
 		{"bogus", "127.0.0.1", "s", false, true},

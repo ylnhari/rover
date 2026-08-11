@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ylnhari/rover/internal/childenv"
 )
 
 // ProbeResult is the structured outcome of checking whether something actually
@@ -136,9 +138,7 @@ func (m *Manager) ValidateProject(dir, startCmd string, port int) (*ValidationRe
 	cmd := exec.Command(shell, flag, startCmd)
 	cmd.Dir = dir
 	setProcessGroup(cmd)
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
+	cmd.Env = childenv.Filter(os.Environ())
 	cmd.Env = append(cmd.Env,
 		"PYTHONUNBUFFERED=1",
 		"PYTHONIOENCODING=utf-8",
@@ -225,9 +225,7 @@ func (m *Manager) ValidateTask(dir, startCmd string) (*ValidationReport, error) 
 	cmd := exec.Command(shell, flag, startCmd)
 	cmd.Dir = dir
 	setProcessGroup(cmd)
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
-	}
+	cmd.Env = childenv.Filter(os.Environ())
 	cmd.Env = append(cmd.Env,
 		"PYTHONUNBUFFERED=1",
 		"PYTHONIOENCODING=utf-8",
