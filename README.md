@@ -241,7 +241,8 @@ name under the master secret with context `rover-proxy-verifier-key-v1`. The val
 is the lowercase hex digest, and its ASCII bytes key the request HMAC. That HMAC
 covers context `rover-proxy-request-v1`, the
 timestamp, loopback backend authority (`127.0.0.1:<port>`), HTTP method, and exact
-request URI (escaped path plus raw query), separated by NUL bytes. A launched,
+upstream request URI as Go's proxy sends it (escaped path plus the raw outgoing
+query), separated by NUL bytes. A launched,
 proxy-enabled project receives only its own derived value as `ROVER_PROXY_VERIFY`;
 an inherited value with that name is removed first. It cannot authenticate rover's
 control API, recover the master secret, or validate another project's proof.

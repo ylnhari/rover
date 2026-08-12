@@ -10,6 +10,11 @@ Rover uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Security
+- **Proxy proofs now cover the request target the backend receives.** Equivalent
+  incoming query encodings can have a different upstream representation (for
+  example, `%20` arriving as `+`). Rover now signs the finalized outgoing method
+  and request URI, so proof-aware backends accept encoded and Unicode searches without
+  weakening method, audience, target, freshness, or replay binding.
 - **The direct link is now a verified fact, and never an auth bypass.** The blue
   "direct" project link used to be inferred from the app's log banner (with loopback
   hostnames rewritten to a guessed local IP) or fall back to a raw `127.0.0.1` URL —

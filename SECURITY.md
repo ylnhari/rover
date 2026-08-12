@@ -47,7 +47,7 @@ Rover executes arbitrary shell commands. Always:
 ### Project Proxies
 - New projects default to `requires_auth: true`; this per-project gate is enforced even when the global `--proxy-auth` mode is off
 - Rover strips its proxy cookie, browser `Origin`, client identity/forwarding headers, and inbound `X-Rover-*` headers before forwarding
-- With a configured master secret, every forwarded request carries a fresh `X-Rover-Proxy` HMAC bound to its project, target, timestamp, method, and exact request URI
+- With a configured master secret, every forwarded request carries a fresh `X-Rover-Proxy` HMAC bound to its project, target, timestamp, and exact upstream method/request URI as sent to the backend
 - A launched proxy-enabled project receives only its one-way project-scoped `ROVER_PROXY_VERIFY` value; inherited values are removed, and the master secret is never passed
 - A backend treating the proof as authorization must use one long-lived replay-aware verifier; replay state is process-local unless backend workers explicitly share it
 - HMAC verification is symmetric: a backend can mint proofs for itself with its scoped value, but cannot authenticate rover's API or another project

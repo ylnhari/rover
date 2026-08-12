@@ -1795,9 +1795,47 @@ func TestProxyPresentsLoopbackRequest(t *testing.T) {
 	}
 }
 
+func TestProxyProofCoversNormalizedUpstreamRequestURI(t *testing.T) {
+	key := auth.DeriveProxyRequestKey("synthetic-secret", "synthetic-project")
+	for _, requestURI := range []string{
+		"/search?q=Mom%20Aadhaar",
+		"/search?q=Mom+Aadhaar",
+		"/search?q=%E0%A4%AE%E0%A4%BE%E0%A4%81",
+	} {
+		t.Run(url.QueryEscape(requestURI), func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				proof := r.Header.Get("X-Rover-Proxy")
+				if err := auth.NewProxyRequestVerifier().Verify(
+					key, proof, r.Host, r.Method, r.URL.RequestURI(),
+				); err != nil {
+					t.Errorf("proof failed for backend URI %q: %v", r.URL.RequestURI(), err)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer backend.Close()
+
+			target, err := url.Parse(backend.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxy := httptest.NewServer(&httputil.ReverseProxy{
+				Rewrite: transparentRewrite(target, key),
+			})
+			defer proxy.Close()
+
+			response, err := http.Get(proxy.URL + requestURI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+		})
+	}
+}
+
 func TestTransparentRewriteStripsSensitiveTrailers(t *testing.T) {
 	in := httptest.NewRequest(http.MethodPost, "http://phone.example.ts.net:55038/cards?view=full", strings.NewReader("body"))
 	out := in.Clone(in.Context())
+	out.Method = http.MethodPut
 	out.Trailer = http.Header{
 		"X-Rover-Proxy":   {"attacker"},
 		"X-Rover-Extra":   {"attacker"},
@@ -1828,6 +1866,11 @@ func TestTransparentRewriteStripsSensitiveTrailers(t *testing.T) {
 	proof := out.Header.Get("X-Rover-Proxy")
 	if proof == "" || proof == "attacker" {
 		t.Fatalf("rewrite did not replace spoofed proof: %q", proof)
+	}
+	if err := auth.NewProxyRequestVerifier().Verify(
+		proofKey, proof, target.Host, out.Method, out.URL.RequestURI(),
+	); err != nil {
+		t.Fatalf("proof did not cover finalized outbound method and URI: %v", err)
 	}
 }
 

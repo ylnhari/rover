@@ -441,7 +441,12 @@ func transparentRewrite(target *url.URL, proofKey string) func(*httputil.ProxyRe
 		pr.Out.Header.Set("X-Forwarded-Host", origHost)
 		pr.Out.Header.Set("X-Forwarded-Proto", scheme)
 		if proofKey != "" {
-			proof := auth.IssueProxyRequestProof(proofKey, target.Host, pr.In.Method, pr.In.URL.RequestURI())
+			// Sign the finalized outbound representation. Go's transport
+			// serializes these Out fields for the backend, and the proxy boundary
+			// may represent an equivalent incoming request target differently.
+			proof := auth.IssueProxyRequestProof(
+				proofKey, target.Host, pr.Out.Method, pr.Out.URL.RequestURI(),
+			)
 			pr.Out.Header.Set("X-Rover-Proxy", proof)
 		}
 	}
