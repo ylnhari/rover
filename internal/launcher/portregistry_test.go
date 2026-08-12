@@ -278,7 +278,8 @@ func TestExplicitPortWorksWhenTheEntryHasNoPort(t *testing.T) {
 }
 
 func TestSamePathIgnoresTrailingSeparatorsAndCase(t *testing.T) {
-	if !samePath(`C:\p\demo`, `C:\p\demo\`) {
+	base := filepath.Join("root", "demo")
+	if !samePath(base, base+string(os.PathSeparator)) {
 		t.Error("a trailing separator is the same directory")
 	}
 	// Case-insensitivity applies on Windows only; on other platforms these
