@@ -61,7 +61,11 @@ func TestHelperHTTPServer(t *testing.T) {
 			fmt.Fprint(w, "helper ok")
 		}),
 	}
-	srv.ListenAndServe()
+	ln := listenOnLoopback(t, port)
+	defer ln.Close()
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		t.Fatal(err)
+	}
 }
 
 // helperServerCmd returns a start command that re-executes this test binary as
@@ -92,7 +96,9 @@ func TestHelperOneShotHTTPServer(t *testing.T) {
 			srv.Close()
 		}()
 	})
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	ln := listenOnLoopback(t, port)
+	defer ln.Close()
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		t.Fatal(err)
 	}
 }
@@ -163,7 +169,9 @@ func TestHelperScopedProxyServer(t *testing.T) {
 			srv.Close()
 		}()
 	})
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	ln := listenOnLoopback(t, port)
+	defer ln.Close()
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		t.Fatal(err)
 	}
 }
@@ -182,10 +190,7 @@ func TestHelperRawTCPServer(t *testing.T) {
 	if port == "" {
 		t.Fatal("PORT not set")
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, port)
 	defer ln.Close()
 	for {
 		conn, err := ln.Accept()
@@ -216,10 +221,7 @@ func helperCleanEnvironmentCmd() string {
 
 func freeTCPPort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, "0")
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	return port
@@ -513,9 +515,8 @@ func TestProxyChildReceivesMatchingScopedVerifier(t *testing.T) {
 	t.Setenv("ROVER_PROXY_VERIFY", "untrusted-parent-value")
 
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := newTestManager(dir)
 	m.registryPath = filepath.Join(dir, "registry.json")
-	m.SetBindHost("127.0.0.1")
 	m.SetProxyAuth(false, testScopedProxyMaster, "2278", false)
 	m.SetProbeTimeout(15 * time.Second)
 	port := freeTCPPort(t)
@@ -645,14 +646,11 @@ func TestValidateProjectOccupiedPort(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, "0")
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	_, err = m.ValidateProject(dir, "echo hi", port)
+	_, err := m.ValidateProject(dir, "echo hi", port)
 	if err == nil || !strings.Contains(err.Error(), "already in use") {
 		t.Errorf("expected occupied-port refusal, got %v", err)
 	}
@@ -758,9 +756,8 @@ func TestStartStopProject(t *testing.T) {
 func TestStartConfirmsReadyAndProxies(t *testing.T) {
 	t.Setenv("ROVER_TEST_HELPER", "1")
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := newTestManager(dir)
 	m.registryPath = filepath.Join(dir, "registry.json")
-	m.SetBindHost("127.0.0.1")
 	m.SetProbeTimeout(15 * time.Second)
 
 	appDir := filepath.Join(dir, "webapp")
@@ -966,10 +963,7 @@ func TestAdoptAndDetach(t *testing.T) {
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "external") }),
 	}
-	ln, err := net.Listen("tcp", srv.Addr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, fmt.Sprintf("%d", port))
 	go srv.Serve(ln)
 	defer srv.Close()
 
@@ -1007,7 +1001,7 @@ func TestAdoptAndDetach(t *testing.T) {
 
 func TestAdoptNothingListening(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := newTestManager(dir)
 	m.registryPath = filepath.Join(dir, "registry.json")
 
 	appDir := filepath.Join(dir, "ghost")
@@ -1024,7 +1018,7 @@ func TestAdoptNothingListening(t *testing.T) {
 
 func TestStartAlreadyRunning(t *testing.T) {
 	dir := t.TempDir()
-	m := NewManager(dir)
+	m := newTestManager(dir)
 	m.registryPath = filepath.Join(dir, "registry.json")
 
 	appDir := filepath.Join(dir, "echo")
@@ -1362,8 +1356,7 @@ func waitForRunning(t *testing.T, m *Manager, name string, timeout time.Duration
 }
 
 func TestVerifyDirectURL(t *testing.T) {
-	m := NewManager(t.TempDir())
-	m.SetBindHost("127.0.0.1")
+	m := newTestManager(t.TempDir())
 
 	if got := m.verifyDirectURL(0, false); got != "" {
 		t.Errorf("no port: want empty, got %q", got)
@@ -1376,36 +1369,41 @@ func TestVerifyDirectURL(t *testing.T) {
 
 	// Loopback-only listener: not reachable on rover's advertised interface,
 	// so no direct URL may be advertised — regardless of what the app logs.
-	lb, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	lb := listenOnLoopback(t, "0")
 	defer lb.Close()
 	if got := m.verifyDirectURL(lb.Addr().(*net.TCPAddr).Port, false); got != "" {
 		t.Errorf("loopback-only listener: want empty, got %q", got)
 	}
 
-	// All-interfaces listener: the socket really is reachable on rover's
-	// interface, so the verified direct URL is advertised.
-	all, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatal(err)
+	// Simulate a successful dial to rover's advertised interface. A real
+	// non-loopback fixture would trigger Windows Firewall for the test binary.
+	const directPort = 43210
+	dialCalls := 0
+	dial := func(network, address string, timeout time.Duration) (net.Conn, error) {
+		dialCalls++
+		if network != "tcp" || address != net.JoinHostPort(ip, fmt.Sprint(directPort)) || timeout != time.Second {
+			t.Fatalf("unexpected direct-link dial: network=%q address=%q timeout=%v", network, address, timeout)
+		}
+		client, peer := net.Pipe()
+		_ = peer.Close()
+		return client, nil
 	}
-	defer all.Close()
-	allPort := all.Addr().(*net.TCPAddr).Port
-	want := fmt.Sprintf("http://%s:%d", ip, allPort)
-	if got := m.verifyDirectURL(allPort, false); got != want {
-		t.Errorf("all-interfaces listener: want %q, got %q", want, got)
+	want := fmt.Sprintf("http://%s:%d", ip, directPort)
+	if got := m.verifyDirectURLUsing(directPort, false, dial); got != want {
+		t.Errorf("reachable listener: want %q, got %q", want, got)
 	}
-	if got := m.verifyDirectURL(allPort, true); got != "" {
+	if got := m.verifyDirectURLUsing(directPort, true, dial); got != "" {
 		t.Errorf("requires_auth project: want empty, got %q", got)
 	}
 
 	// With proxy auth on, a direct link would silently bypass the auth gate,
 	// so it is never advertised even when reachable.
 	m.SetProxyAuth(true, "secret", "2278", false)
-	if got := m.verifyDirectURL(allPort, false); got != "" {
+	if got := m.verifyDirectURLUsing(directPort, false, dial); got != "" {
 		t.Errorf("proxy auth on: want empty, got %q", got)
+	}
+	if dialCalls != 1 {
+		t.Errorf("gated direct-link checks made %d dial attempts; want 1 total", dialCalls)
 	}
 }
 
@@ -1587,10 +1585,7 @@ func TestStartPortInUse(t *testing.T) {
 	appDir := filepath.Join(dir, "busy")
 	os.MkdirAll(appDir, 0755)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, "0")
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 
@@ -1603,7 +1598,7 @@ func TestStartPortInUse(t *testing.T) {
 	}}
 	saveRoverRegistry(m.registryPath, reg)
 
-	err = m.Start("busy", StartOptions{})
+	err := m.Start("busy", StartOptions{})
 	if !errors.Is(err, ErrPortInUse) {
 		t.Fatalf("expected ErrPortInUse, got %v", err)
 	}
@@ -1628,10 +1623,7 @@ func TestStartKillOccupantRequiresMatchingPID(t *testing.T) {
 	appDir := filepath.Join(dir, "busy2")
 	os.MkdirAll(appDir, 0755)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, "0")
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 
@@ -1643,7 +1635,7 @@ func TestStartKillOccupantRequiresMatchingPID(t *testing.T) {
 	// A stale/wrong confirm_pid must NOT kill anything and must re-report the
 	// conflict. (Also guards the rover-self case: the occupant here is this
 	// process, and KillConfirmedListener refuses to kill self.)
-	err = m.Start("busy2", StartOptions{KillOccupant: true, ConfirmPID: 1})
+	err := m.Start("busy2", StartOptions{KillOccupant: true, ConfirmPID: 1})
 	if !errors.Is(err, ErrPortInUse) {
 		t.Fatalf("expected conflict, got %v", err)
 	}
@@ -1654,10 +1646,7 @@ func TestStartKillOccupantRequiresMatchingPID(t *testing.T) {
 }
 
 func TestFindListenerOnPort(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, "0")
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 
@@ -1700,10 +1689,7 @@ func TestRequiredAuthProxyRefusesMissingOrWrongCredential(t *testing.T) {
 		backendHits.Add(1)
 		fmt.Fprint(w, "ok")
 	})}
-	bln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	bln := listenOnLoopback(t, "0")
 	defer bln.Close()
 	backendPort := bln.Addr().(*net.TCPAddr).Port
 	go backend.Serve(bln)
@@ -1711,8 +1697,7 @@ func TestRequiredAuthProxyRefusesMissingOrWrongCredential(t *testing.T) {
 
 	const secret = "test-only-proxy-secret"
 	proofKey := auth.DeriveProxyRequestKey(secret, "required-auth-test")
-	m := NewManager(t.TempDir())
-	m.SetBindHost("127.0.0.1")
+	m := newTestManager(t.TempDir())
 	// The global gate is deliberately off. requires_auth must still enforce the
 	// cookie gate for this project.
 	m.SetProxyAuth(false, secret, "2278", false)
@@ -1772,8 +1757,7 @@ func TestRequiredAuthProxyRefusesMissingOrWrongCredential(t *testing.T) {
 }
 
 func TestRequiredAuthProxyFailsClosedWithoutSecret(t *testing.T) {
-	m := NewManager(t.TempDir())
-	m.SetBindHost("127.0.0.1")
+	m := newTestManager(t.TempDir())
 	rp := &runningProcess{done: make(chan struct{})}
 	ln, srv, port, err := m.startProxy(rp, 8080, 0, true, "")
 	if err == nil || !strings.Contains(err.Error(), "requires_auth") {
@@ -1801,10 +1785,7 @@ func TestProxyPresentsLoopbackRequest(t *testing.T) {
 		}
 		fmt.Fprint(w, "ok")
 	})}
-	bln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	bln := listenOnLoopback(t, "0")
 	defer bln.Close()
 	backendPort := bln.Addr().(*net.TCPAddr).Port
 	go backend.Serve(bln)
@@ -1812,8 +1793,7 @@ func TestProxyPresentsLoopbackRequest(t *testing.T) {
 
 	const secret = "test-only-proxy-secret"
 	proofKey := auth.DeriveProxyRequestKey(secret, "proxy-rewrite-test")
-	m := NewManager(t.TempDir())
-	m.SetBindHost("127.0.0.1")
+	m := newTestManager(t.TempDir())
 	m.SetProxyAuth(false, secret, "2278", false)
 	rp := &runningProcess{done: make(chan struct{})}
 	pln, srv, pport, err := m.startProxy(rp, backendPort, 0, false, proofKey)
@@ -1905,7 +1885,7 @@ func TestProxyProofCoversNormalizedUpstreamRequestURI(t *testing.T) {
 		"/search?q=%E0%A4%AE%E0%A4%BE%E0%A4%81",
 	} {
 		t.Run(url.QueryEscape(requestURI), func(t *testing.T) {
-			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			backend := newLoopbackHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				proof := r.Header.Get("X-Rover-Proxy")
 				if err := auth.NewProxyRequestVerifier().Verify(
 					key, proof, r.Host, r.Method, r.URL.RequestURI(),
@@ -1920,7 +1900,7 @@ func TestProxyProofCoversNormalizedUpstreamRequestURI(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			proxy := httptest.NewServer(&httputil.ReverseProxy{
+			proxy := newLoopbackHTTPTestServer(t, &httputil.ReverseProxy{
 				Rewrite: transparentRewrite(target, key),
 			})
 			defer proxy.Close()

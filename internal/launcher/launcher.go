@@ -293,6 +293,14 @@ func proxyURLHost(bindHost string) string {
 // direct link would silently bypass the gate, so it is never advertised
 // alongside the authenticated proxy link.
 func (m *Manager) verifyDirectURL(port int, requiresAuth bool) string {
+	return m.verifyDirectURLUsing(port, requiresAuth, net.DialTimeout)
+}
+
+func (m *Manager) verifyDirectURLUsing(
+	port int,
+	requiresAuth bool,
+	dial func(string, string, time.Duration) (net.Conn, error),
+) string {
 	if m.proxyAuthOn || requiresAuth || port <= 0 {
 		return ""
 	}
@@ -300,7 +308,7 @@ func (m *Manager) verifyDirectURL(port int, requiresAuth bool) string {
 	if host == "localhost" {
 		return ""
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), time.Second)
+	conn, err := dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)), time.Second)
 	if err != nil {
 		return ""
 	}

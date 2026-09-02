@@ -23,13 +23,13 @@ const testSecret = "test-secret-123"
 
 func newHandler(t *testing.T) http.Handler {
 	t.Helper()
-	return server.New(server.Config{Secret: testSecret}).Handler()
+	return newConfiguredHandler(t, server.Config{Secret: testSecret})
 }
 
 // newTestServer starts a test server and returns it plus a valid auth token.
 func newTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	s := httptest.NewServer(newHandler(t))
+	s := newLoopbackHTTPTestServer(t, newHandler(t))
 	tok := loginToken(t, s.URL, testSecret)
 	t.Cleanup(s.Close)
 	return s, tok
@@ -153,8 +153,8 @@ func TestWebUI(t *testing.T) {
 func TestWebUIWithoutProjects(t *testing.T) {
 	// Without ProjectsRoot, GET /api/projects hits the catch-all handler
 	// (the webUI). The important thing is projects routes don't crash.
-	h := server.New(server.Config{Secret: testSecret}).Handler()
-	ts := httptest.NewServer(h)
+	h := newConfiguredHandler(t, server.Config{Secret: testSecret})
+	ts := newLoopbackHTTPTestServer(t, h)
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/api/projects")
@@ -185,8 +185,8 @@ func TestAuthStatus(t *testing.T) {
 	}
 
 	// Without secret
-	h := server.New(server.Config{}).Handler()
-	ts2 := httptest.NewServer(h)
+	h := newConfiguredHandler(t, server.Config{})
+	ts2 := newLoopbackHTTPTestServer(t, h)
 	defer ts2.Close()
 
 	resp2, err := http.Get(ts2.URL + "/api/auth")
@@ -272,8 +272,8 @@ func TestLogin(t *testing.T) {
 }
 
 func TestLoginSecretLessMode(t *testing.T) {
-	h := server.New(server.Config{}).Handler()
-	ts := httptest.NewServer(h)
+	h := newConfiguredHandler(t, server.Config{})
+	ts := newLoopbackHTTPTestServer(t, h)
 	defer ts.Close()
 
 	resp, err := http.Post(ts.URL+"/api/auth", "application/json", bytes.NewBufferString(`{}`))
@@ -288,11 +288,11 @@ func TestLoginSecretLessMode(t *testing.T) {
 
 func TestProxyCookieEndpointMintsScopedCredential(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{
 		Addr:         "127.0.0.1:2278",
 		ProjectsRoot: dir,
 		Secret:       testSecret,
-	}).Handler())
+	}))
 	defer ts.Close()
 	controlToken := loginToken(t, ts.URL, testSecret)
 
@@ -321,10 +321,10 @@ func TestProxyCookieEndpointMintsScopedCredential(t *testing.T) {
 
 func TestProxyCookieEndpointFailsClosedWithoutSecret(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{
 		Addr:         "127.0.0.1:2278",
 		ProjectsRoot: dir,
-	}).Handler())
+	}))
 	defer ts.Close()
 
 	resp := getJSON(t, ts.URL+"/api/proxy-cookie", "")
@@ -350,8 +350,8 @@ func TestCreateSessionNoAuth(t *testing.T) {
 	}
 
 	// Secret-less mode should allow without secret
-	h := server.New(server.Config{}).Handler()
-	ts2 := httptest.NewServer(h)
+	h := newConfiguredHandler(t, server.Config{})
+	ts2 := newLoopbackHTTPTestServer(t, h)
 	defer ts2.Close()
 
 	resp2 := postJSON(t, ts2.URL+"/api/sessions", `{"command":"echo hi"}`, "")
@@ -631,15 +631,15 @@ func projectsHandler(t *testing.T) (http.Handler, func()) {
 		t.Fatal(err)
 	}
 
-	return server.New(server.Config{
+	return newConfiguredHandler(t, server.Config{
 		ProjectsRoot: dir,
 		Secret:       testSecret,
-	}).Handler(), func() {}
+	}), func() {}
 }
 
 func TestProjectListEmpty(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -660,7 +660,7 @@ func TestProjectListDirs(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, "myapp"), 0755)
 	os.MkdirAll(filepath.Join(dir, ".hidden"), 0755)
 
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -684,7 +684,7 @@ func TestProjectFiles(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, "myapp", "__pycache__"), 0755)
 	os.WriteFile(filepath.Join(dir, "myapp", "__pycache__", "cache.py"), []byte(""), 0644)
 
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -720,7 +720,11 @@ func TestHelperHTTPServer(t *testing.T) {
 			fmt.Fprint(w, "helper ok")
 		}),
 	}
-	srv.ListenAndServe()
+	ln := listenOnLoopback(t, port)
+	defer ln.Close()
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		t.Fatal(err)
+	}
 }
 
 func TestHelperOneShotHTTPServer(t *testing.T) {
@@ -740,17 +744,16 @@ func TestHelperOneShotHTTPServer(t *testing.T) {
 			srv.Close()
 		}()
 	})
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	ln := listenOnLoopback(t, port)
+	defer ln.Close()
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		t.Fatal(err)
 	}
 }
 
 func freeTCPPort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ln := listenOnLoopback(t, "0")
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	return port
@@ -761,7 +764,7 @@ func TestAddAndRemoveProject(t *testing.T) {
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, "testapp"), 0755)
 
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -841,7 +844,7 @@ func TestAddAndRemoveProject(t *testing.T) {
 
 func TestAddProjectInvalidInput(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -860,7 +863,7 @@ func TestAddProjectInvalidInput(t *testing.T) {
 
 func TestRemoveNonexistentProject(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -881,7 +884,7 @@ func TestStartStopProjectViaAPI(t *testing.T) {
 	appDir := filepath.Join(dir, "runtime")
 	os.MkdirAll(appDir, 0755)
 
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -926,7 +929,7 @@ func TestStartStopProjectViaAPI(t *testing.T) {
 }
 
 func TestCommandGuardViaAPI(t *testing.T) {
-	ts := httptest.NewServer(server.New(server.Config{Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -945,7 +948,7 @@ func TestCommandGuardViaAPI(t *testing.T) {
 	}
 
 	// with the guard disabled, the interactive command is allowed through
-	ts2 := httptest.NewServer(server.New(server.Config{Secret: testSecret, DisableCommandGuard: true}).Handler())
+	ts2 := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{Secret: testSecret, DisableCommandGuard: true}))
 	defer ts2.Close()
 	token2 := loginToken(t, ts2.URL, testSecret)
 	resp3 := postJSON(t, ts2.URL+"/api/sessions", `{"command":"vim notes.txt"}`, token2)
@@ -957,7 +960,7 @@ func TestCommandGuardViaAPI(t *testing.T) {
 
 func TestStartNonexistentProject(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -970,7 +973,7 @@ func TestStartNonexistentProject(t *testing.T) {
 
 func TestStopNotRunningProject(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 
@@ -983,7 +986,7 @@ func TestStopNotRunningProject(t *testing.T) {
 
 func TestProjectStreamNotFound(t *testing.T) {
 	dir := t.TempDir()
-	ts := httptest.NewServer(server.New(server.Config{ProjectsRoot: dir, Secret: testSecret}).Handler())
+	ts := newLoopbackHTTPTestServer(t, newConfiguredHandler(t, server.Config{ProjectsRoot: dir, Secret: testSecret}))
 	defer ts.Close()
 	token := loginToken(t, ts.URL, testSecret)
 

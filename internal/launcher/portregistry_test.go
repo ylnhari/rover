@@ -24,7 +24,7 @@ func writePortRegistry(t *testing.T, entries map[string]portEntry) string {
 
 func quietManager(t *testing.T) *Manager {
 	t.Helper()
-	m := NewManager(t.TempDir())
+	m := newTestManager(t.TempDir())
 	m.SetLogger(func(string, ...any) {})
 	return m
 }
