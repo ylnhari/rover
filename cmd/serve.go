@@ -3,6 +3,7 @@ package cmd
 import (
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,7 +12,13 @@ import (
 	"time"
 
 	"github.com/ylnhari/rover/internal/launcher"
+	"github.com/ylnhari/rover/internal/rotatelog"
 	"github.com/ylnhari/rover/internal/server"
+)
+
+const (
+	operationalLogMaxBytes = 2 * 1024 * 1024
+	operationalLogBackups  = 3
 )
 
 func defaultSessionsFile() string {
@@ -22,7 +29,39 @@ func defaultSessionsFile() string {
 	return filepath.Join(filepath.Dir(exe), "sessions.json")
 }
 
-func runServe(args []string) error {
+func defaultOperationalLogFile() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), "rover.log")
+}
+
+func operationalLogOutput() (io.Writer, io.Closer) {
+	path := defaultOperationalLogFile()
+	if path == "" {
+		return os.Stdout, nil
+	}
+	output, closer, err := newOperationalLogOutput(path, os.Stdout, operationalLogMaxBytes, operationalLogBackups)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: operational log unavailable at %s: %v\n", path, err)
+		return os.Stdout, nil
+	}
+	fmt.Fprintf(output, "Operational log: %s\n", path)
+	return output, closer
+}
+
+func newOperationalLogOutput(path string, console io.Writer, maxBytes int64, backups int) (io.Writer, io.Closer, error) {
+	file, err := rotatelog.New(path, maxBytes, backups)
+	if err != nil {
+		return console, nil, err
+	}
+	// Keep the file first: a scheduled task may have an unusable stdout handle,
+	// and MultiWriter stops at the first writer error.
+	return io.MultiWriter(file, console), file, nil
+}
+
+func runServe(args []string) (runErr error) {
 	fs := flag.NewFlagSet("rover serve", flag.ContinueOnError)
 	addr := fs.String("addr", ":2278", "address to listen on (host:port)")
 	secret := fs.String("secret", "", "shared secret for auth (or $ROVER_SECRET)")
@@ -43,6 +82,16 @@ func runServe(args []string) error {
 		return err
 	}
 
+	logOutput, logCloser := operationalLogOutput()
+	if logCloser != nil {
+		defer logCloser.Close()
+	}
+	defer func() {
+		if runErr != nil {
+			fmt.Fprintf(logOutput, "rover: %v\n", runErr)
+		}
+	}()
+
 	sec := *secret
 	if sec == "" {
 		sec = os.Getenv("ROVER_SECRET")
@@ -54,7 +103,7 @@ func runServe(args []string) error {
 		// interface (including the all-interfaces default ":port") without a
 		// secret would expose the host to the network and is refused.
 		if isLoopbackBind(host) {
-			fmt.Println("WARNING: Running without a secret. Authentication is disabled, but rover is bound to loopback only.")
+			fmt.Fprintln(logOutput, "WARNING: Running without a secret. Authentication is disabled, but rover is bound to loopback only.")
 		} else {
 			return fmt.Errorf("refusing to start without a secret while bound to %q: set --secret or $ROVER_SECRET, or bind to 127.0.0.1 for local-only use", *addr)
 		}
@@ -75,10 +124,10 @@ func runServe(args []string) error {
 		return err
 	}
 	if !proxyAuthOn && !isLoopbackBind(host) {
-		fmt.Printf("WARNING: bound to %q with global proxy auth OFF — projects without requires_auth are reachable WITHOUT authentication on that network. Use --proxy-auth on, require auth per project, or bind to a Tailscale IP.\n", *addr)
+		fmt.Fprintf(logOutput, "WARNING: bound to %q with global proxy auth OFF — projects without requires_auth are reachable WITHOUT authentication on that network. Use --proxy-auth on, require auth per project, or bind to a Tailscale IP.\n", *addr)
 	}
 
-	if err := ensurePortFree(*addr, *takeoverPort); err != nil {
+	if err := ensurePortFree(*addr, *takeoverPort, logOutput); err != nil {
 		return err
 	}
 
@@ -96,9 +145,9 @@ func runServe(args []string) error {
 	}
 	if projectsRoot != "" {
 		if info, err := os.Stat(projectsRoot); err == nil && info.IsDir() {
-			fmt.Printf("Projects root: %s\n", projectsRoot)
+			fmt.Fprintf(logOutput, "Projects root: %s\n", projectsRoot)
 		} else {
-			fmt.Printf("WARNING: Projects root %q not accessible, launcher disabled\n", projectsRoot)
+			fmt.Fprintf(logOutput, "WARNING: Projects root %q not accessible, launcher disabled\n", projectsRoot)
 			projectsRoot = ""
 		}
 	}
@@ -113,7 +162,7 @@ func runServe(args []string) error {
 		if _, err := os.Stat(portRegistry); err != nil {
 			return fmt.Errorf("--registry %s: %w", portRegistry, err)
 		}
-		fmt.Printf("Port registry:  %s\n", portRegistry)
+		fmt.Fprintf(logOutput, "Port registry:  %s\n", portRegistry)
 	}
 
 	return server.New(server.Config{
@@ -128,6 +177,7 @@ func runServe(args []string) error {
 		AllowCmds:           allowCmds,
 		SessionsFile:        defaultSessionsFile(),
 		LogFormat:           *logFormat,
+		LogOutput:           logOutput,
 		DisableCommandGuard: *noGuard,
 		ProxyAuthOn:         proxyAuthOn,
 		ValidationTimeout:   *validationTimeout,
@@ -192,8 +242,20 @@ func isTailnetBind(host string) bool {
 
 // ensurePortFree checks rover's own port. If occupied it names the listener
 // and fails, unless --takeover-port explicitly authorizes killing it.
-func ensurePortFree(addr string, takeover bool) error {
-	ln, err := net.Listen("tcp", addr)
+func ensurePortFree(addr string, takeover bool, output io.Writer) error {
+	return ensurePortFreeUsing(addr, takeover, output, net.Listen, launcher.FindListenerOnPort, launcher.KillConfirmedListener, time.Sleep)
+}
+
+func ensurePortFreeUsing(
+	addr string,
+	takeover bool,
+	output io.Writer,
+	listen func(string, string) (net.Listener, error),
+	findListener func(int) *launcher.Occupant,
+	killListener func(int, int) error,
+	wait func(time.Duration),
+) error {
+	ln, err := listen("tcp", addr)
 	if err == nil {
 		ln.Close()
 		return nil
@@ -208,7 +270,7 @@ func ensurePortFree(addr string, takeover bool) error {
 		return fmt.Errorf("port check: %w", err)
 	}
 
-	occ := launcher.FindListenerOnPort(port)
+	occ := findListener(port)
 	if !takeover {
 		if occ != nil {
 			return fmt.Errorf("port %s is in use by %s — stop it, use a different --addr, or pass --takeover-port to kill it", addr, occ)
@@ -219,19 +281,19 @@ func ensurePortFree(addr string, takeover bool) error {
 	if occ == nil {
 		return fmt.Errorf("port %s is in use but the listener could not be identified; refusing to take over", addr)
 	}
-	fmt.Printf("Port %s is in use by %s; --takeover-port set, killing it...\n", addr, occ)
-	if err := launcher.KillConfirmedListener(port, occ.PID); err != nil {
+	fmt.Fprintf(output, "Port %s is in use by %s; --takeover-port set, killing it...\n", addr, occ)
+	if err := killListener(port, occ.PID); err != nil {
 		return fmt.Errorf("takeover failed: %w", err)
 	}
 
 	for i := 0; i < 5; i++ {
-		ln, err = net.Listen("tcp", addr)
+		ln, err = listen("tcp", addr)
 		if err == nil {
 			ln.Close()
-			fmt.Printf("Successfully freed port %s\n", addr)
+			fmt.Fprintf(output, "Successfully freed port %s\n", addr)
 			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		wait(200 * time.Millisecond)
 	}
 	return fmt.Errorf("port %s is still in use after takeover: %w", addr, err)
 }

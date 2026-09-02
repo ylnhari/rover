@@ -56,6 +56,7 @@ Open [http://localhost:2278](http://localhost:2278) and log in with your secret.
 - **Security headers** — `X-Frame-Options`, `X-Content-Type-Options`, `Content-Security-Policy`
 - **Optional TLS** — `--tls-cert` / `--tls-key`
 - **Structured audit log** — every exec, login, project change, adopt and confirmed kill is logged with IP and timestamp
+- **Rotating operational log** — `rover.log` is written next to the executable and rotated at 2 MiB, retaining three backups, so background/scheduled-task failures remain diagnosable
 
 ---
 
@@ -111,6 +112,12 @@ Flags:
   --validation-timeout dur     how long registration/start probes wait for the app
                                to start listening                    (default: 30s)
 ```
+
+If a launched project does not listen before `--validation-timeout`, Rover now
+records the start as failed and stops that child instead of leaving the card in
+`Starting` indefinitely. Operational and launcher diagnostics are written to
+`rover.log` beside the executable; older files are retained as `rover.log.1`
+through `rover.log.3`.
 
 ### Examples
 

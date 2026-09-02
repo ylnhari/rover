@@ -446,9 +446,10 @@ type Config struct {
 	// ports, matched by path. Empty = use the ports stored in rover's own
 	// project registry, which is the default behavior.
 	PortRegistry string
-	AllowCmds    []string // if non-empty, only commands with a matching prefix are permitted
-	SessionsFile string   // path to sessions persistence file; empty = no persistence
-	LogFormat    string   // "text" (default) or "json"
+	AllowCmds    []string  // if non-empty, only commands with a matching prefix are permitted
+	SessionsFile string    // path to sessions persistence file; empty = no persistence
+	LogFormat    string    // "text" (default) or "json"
+	LogOutput    io.Writer // optional operational log sink; nil = stdout
 	// DisableCommandGuard turns off the built-in block on interactive / GUI /
 	// stateful commands that can't work in rover's non-interactive shell.
 	// Default (false) = guard enabled.
@@ -507,13 +508,16 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func newLogger(format string) *slog.Logger {
+func newLogger(format string, output io.Writer) *slog.Logger {
+	if output == nil {
+		output = os.Stdout
+	}
 	var h slog.Handler
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if format == "json" {
-		h = slog.NewJSONHandler(os.Stdout, opts)
+		h = slog.NewJSONHandler(output, opts)
 	} else {
-		h = slog.NewTextHandler(os.Stdout, opts)
+		h = slog.NewTextHandler(output, opts)
 	}
 	return slog.New(h)
 }
@@ -528,7 +532,7 @@ func addSecurityHeaders(next http.Handler) http.Handler {
 }
 
 func New(cfg Config) *Server {
-	logger := newLogger(cfg.LogFormat)
+	logger := newLogger(cfg.LogFormat, cfg.LogOutput)
 	sm := NewSessionManager()
 	sm.execTimeout = cfg.ExecTimeout
 	sm.maxOutput = cfg.MaxOutput

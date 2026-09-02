@@ -768,15 +768,34 @@ func (m *Manager) confirmStarted(name string, rp *runningProcess, proj ProjectIn
 
 	res := probeServer(ctx, port)
 	if !res.Listening {
+		select {
+		case <-rp.done:
+			return // reaper reports an exit that raced the probe deadline
+		default:
+		}
 		if rp.exited.Load() {
 			return // reaper reports the failure
 		}
-		msg := fmt.Sprintf("[rover] warning: nothing is listening on port %d after %s — the app may use a different port or still be booting\n", port, m.probeTimeout)
-		m.logf("launcher: %s: nothing listening on port %d after %s", name, port, m.probeTimeout)
+		msg := fmt.Sprintf("[rover] error: startup timed out: nothing listened on port %d within %s; the process was stopped. Increase --validation-timeout if this app legitimately needs longer.\n", port, m.probeTimeout)
+		m.logf("launcher: %s: startup timed out; nothing listened on port %d within %s; stopping process", name, port, m.probeTimeout)
 		rp.outputMu.Lock()
 		rp.appendOutput(msg)
 		rp.outputMu.Unlock()
 		rp.broadcast(StreamEvent{Type: "stderr", Data: msg})
+
+		// A start that exhausted its readiness deadline is a failed start, not a
+		// process that should remain in StateStarting forever. Only stop this exact
+		// run: a concurrent Stop may already have removed it, and a later Start must
+		// never be affected by this goroutine.
+		m.mu.Lock()
+		current := m.procs[name] == rp
+		m.mu.Unlock()
+		if current {
+			if err := killProcess(rp.cmd); err != nil {
+				m.logf("launcher: %s: could not stop process after startup timeout: %v", name, err)
+			}
+			rp.cancel()
+		}
 		return
 	}
 
@@ -1092,49 +1111,64 @@ func (rp *runningProcess) captureOutput(stdout, stderr io.Reader) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	scan := func(r io.Reader, kind string) {
+	read := func(r io.Reader, kind string) {
 		defer wg.Done()
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			line := sc.Text()
-			out := line + "\n"
+		reader := bufio.NewReaderSize(r, 64*1024)
+		for {
+			chunk, err := reader.ReadSlice('\n')
+			if len(chunk) > 0 {
+				out := string(chunk)
 
-			rp.outputMu.Lock()
-			rp.appendOutput(out)
-			rp.outputMu.Unlock()
-
-			rp.broadcast(StreamEvent{Type: kind, Data: out})
-
-			if match := probeURLRe.FindString(line); match != "" {
-				u := strings.TrimRight(match, ".,;:!?)}>]\"'`")
 				rp.outputMu.Lock()
-				// The readiness probe is authoritative for the URL; a scraped
-				// URL only fills the gap when nothing is known yet. It is kept
-				// exactly as the app printed it — it is a log line, not a
-				// verified listener, so rewriting its host would fabricate a
-				// reachability claim rover hasn't checked (DirectURL is the
-				// only field with a verified host).
-				set := false
-				if rp.info.URL == "" {
-					rp.info.URL = u
-					set = true
-					if parsed, err := url.Parse(u); err == nil && parsed.Port() != "" {
-						if p, err := strconv.Atoi(parsed.Port()); err == nil && rp.info.Port == 0 {
-							rp.info.Port = p
+				rp.appendOutput(out)
+				rp.outputMu.Unlock()
+
+				rp.broadcast(StreamEvent{Type: kind, Data: out})
+
+				if match := probeURLRe.FindString(out); match != "" {
+					u := strings.TrimRight(match, ".,;:!?)}>]\"'`")
+					rp.outputMu.Lock()
+					// The readiness probe is authoritative for the URL; a scraped
+					// URL only fills the gap when nothing is known yet. It is kept
+					// exactly as the app printed it — it is a log line, not a
+					// verified listener, so rewriting its host would fabricate a
+					// reachability claim rover hasn't checked (DirectURL is the
+					// only field with a verified host).
+					set := false
+					if rp.info.URL == "" {
+						rp.info.URL = u
+						set = true
+						if parsed, err := url.Parse(u); err == nil && parsed.Port() != "" {
+							if p, err := strconv.Atoi(parsed.Port()); err == nil && rp.info.Port == 0 {
+								rp.info.Port = p
+							}
 						}
 					}
-				}
-				rp.outputMu.Unlock()
-				if set {
-					rp.broadcast(StreamEvent{Type: "url", Data: u})
+					rp.outputMu.Unlock()
+					if set {
+						rp.broadcast(StreamEvent{Type: "url", Data: u})
+					}
 				}
 			}
+			if err == nil || errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
+			if !errors.Is(err, io.EOF) {
+				warning := fmt.Sprintf("[rover] warning: stopped reading %s: %v\n", kind, err)
+				rp.outputMu.Lock()
+				rp.appendOutput(warning)
+				rp.outputMu.Unlock()
+				rp.broadcast(StreamEvent{Type: "stderr", Data: warning})
+			}
+			return
 		}
 	}
 
-	go scan(stdout, "stdout")
-	go scan(stderr, "stderr")
+	// ReadSlice returns bounded fragments for very long lines. Unlike Scanner,
+	// it never abandons a pipe at a fixed token limit and therefore cannot leave
+	// a verbose child blocked before it reaches its listen call.
+	go read(stdout, "stdout")
+	go read(stderr, "stderr")
 	wg.Wait()
 }
 

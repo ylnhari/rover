@@ -101,6 +101,31 @@ func helperOneShotHTTPServerCmd() string {
 	return os.Args[0] + " -test.run=^TestHelperOneShotHTTPServer$ -test.skip=p{port}"
 }
 
+func TestHelperLargeOutputHTTPServer(t *testing.T) {
+	if os.Getenv("ROVER_TEST_LARGE_OUTPUT_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	requireCleanChildEnvironment(t)
+	fmt.Fprint(os.Stdout, strings.Repeat("x", 2*1024*1024))
+	TestHelperHTTPServer(t)
+}
+
+func helperLargeOutputServerCmd() string {
+	return os.Args[0] + " -test.run=^TestHelperLargeOutputHTTPServer$ -test.skip=p{port}"
+}
+
+func TestHelperNeverListens(t *testing.T) {
+	if os.Getenv("ROVER_TEST_NEVER_LISTENS_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	requireCleanChildEnvironment(t)
+	time.Sleep(30 * time.Second)
+}
+
+func helperNeverListensCmd() string {
+	return os.Args[0] + " -test.run=^TestHelperNeverListens$ -test.skip=p{port}"
+}
+
 func TestHelperScopedProxyServer(t *testing.T) {
 	if os.Getenv("ROVER_TEST_SCOPED_PROXY_HELPER") != "1" {
 		t.Skip("helper process only")
@@ -811,6 +836,83 @@ func TestStartConfirmsReadyAndProxies(t *testing.T) {
 	}
 	if rp == nil || rp.ProxyPort != firstProxyPort {
 		t.Errorf("proxy port not stable across restarts: first %d, second %+v", firstProxyPort, rp)
+	}
+}
+
+func TestStartDrainsLargeOutputBeforeReadiness(t *testing.T) {
+	t.Setenv("ROVER_TEST_HELPER", "1")
+	t.Setenv("ROVER_TEST_LARGE_OUTPUT_HELPER", "1")
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	m.SetProbeTimeout(15 * time.Second)
+
+	appDir := filepath.Join(dir, "large-output")
+	os.MkdirAll(appDir, 0755)
+	port := freeTCPPort(t)
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"large-output": {Name: "large-output", Path: appDir, StartCmd: helperLargeOutputServerCmd(), Port: port},
+	}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start("large-output", StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop("large-output")
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		rp := m.GetRunning("large-output")
+		if rp != nil && rp.State == StateRunning {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("large-output child never reached running state")
+}
+
+func TestStartTimeoutStopsProcessAndRecordsFailure(t *testing.T) {
+	t.Setenv("ROVER_TEST_NEVER_LISTENS_HELPER", "1")
+	dir := t.TempDir()
+	m := NewManager(dir)
+	m.registryPath = filepath.Join(dir, "registry.json")
+	m.SetProbeTimeout(250 * time.Millisecond)
+
+	appDir := filepath.Join(dir, "never-listens")
+	os.MkdirAll(appDir, 0755)
+	port := freeTCPPort(t)
+	reg := roverRegistry{Projects: map[string]ProjectInfo{
+		"never-listens": {Name: "never-listens", Path: appDir, StartCmd: helperNeverListensCmd(), Port: port},
+	}}
+	if err := saveRoverRegistry(m.registryPath, reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start("never-listens", StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if m.GetRunning("never-listens") != nil {
+			_ = m.Stop("never-listens")
+		}
+	})
+
+	deadline := time.Now().Add(10 * time.Second)
+	for m.GetRunning("never-listens") != nil && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if m.GetRunning("never-listens") != nil {
+		t.Fatal("timed-out child is still reported as starting")
+	}
+	exit := m.LastExit("never-listens")
+	if exit == nil {
+		t.Fatal("startup timeout did not record an exit")
+	}
+	if exit.Stopped {
+		t.Fatal("startup timeout must be recorded as a failure, not a user stop")
+	}
+	if exit.Code == 0 {
+		t.Fatal("startup timeout recorded a successful exit")
 	}
 }
 
