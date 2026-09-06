@@ -46,3 +46,9 @@ AGENTIC.local.md
 
 # Claude Code settings
 .claude/
+
+# Local Go build caches and maintenance snapshots
+.rover-go-cache/
+.rover-go-cache-vet/
+maintenance-backups/
+*.bak-*
