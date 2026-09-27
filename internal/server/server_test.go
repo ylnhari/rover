@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,13 +10,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ylnhari/rover/internal/auth"
+	"github.com/ylnhari/rover/internal/launcher"
 	"github.com/ylnhari/rover/internal/server"
 )
 
@@ -585,6 +589,104 @@ func TestSessionExitCode(t *testing.T) {
 	if detail.ExitCode != 7 {
 		t.Errorf("want exit 7, got %d", detail.ExitCode)
 	}
+}
+
+func TestSessionReportsOutputLineBeyondScannerLimit(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("uses Windows process-tree behavior")
+	}
+	ts, token := newTestServer(t)
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	t.Setenv("ROVER_SESSION_TEST_DESCENDANT", "1")
+	t.Setenv("ROVER_SESSION_TEST_PID_FILE", pidFile)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+	if strings.ContainsAny(executable, " \t") {
+		t.Skip("the test executable path contains whitespace that cmd /C cannot quote here")
+	}
+	command := fmt.Sprintf("%s -test.run=TestSessionOutputDescendantHelper", executable)
+	t.Cleanup(func() {
+		pidBytes, readErr := os.ReadFile(pidFile)
+		if readErr != nil {
+			return
+		}
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+		if parseErr != nil || pid <= 0 {
+			return
+		}
+		process, findErr := os.FindProcess(pid)
+		if findErr == nil {
+			_ = launcher.KillChildProcesses(&exec.Cmd{Process: process})
+		}
+	})
+
+	resp := postJSON(t, ts.URL+"/api/sessions", fmt.Sprintf(`{"command":%q}`, command), token)
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created session: %v", err)
+	}
+	resp.Body.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp = getJSON(t, ts.URL+"/api/sessions/"+created.ID, token)
+		var detail struct {
+			Status string `json:"status"`
+			Stderr string `json:"stderr"`
+			Stdout string `json:"stdout"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+			resp.Body.Close()
+			t.Fatalf("decode session detail: %v", err)
+		}
+		resp.Body.Close()
+		if detail.Status != "running" {
+			if detail.Status != "failed" || !strings.Contains(detail.Stderr, "output could not be read") {
+				t.Fatalf("expected clear output-read failure, got status=%q stderr=%q stdout=%q", detail.Status, detail.Stderr, detail.Stdout)
+			}
+			pidBytes, err := os.ReadFile(pidFile)
+			if err != nil {
+				t.Fatalf("read descendant pid: %v", err)
+			}
+			pid := strings.TrimSpace(string(pidBytes))
+			if parsedPID, parseErr := strconv.Atoi(pid); parseErr != nil || parsedPID <= 0 {
+				t.Fatalf("invalid descendant pid %q", pid)
+			}
+			processList, err := exec.Command("tasklist", "/FI", "PID eq "+pid, "/FO", "CSV", "/NH").Output()
+			if err != nil {
+				t.Fatalf("check descendant exit: %v", err)
+			}
+			rows, err := csv.NewReader(bytes.NewReader(processList)).ReadAll()
+			if err != nil {
+				t.Fatalf("parse descendant process check: %v", err)
+			}
+			for _, row := range rows {
+				if len(row) > 1 && row[1] == pid {
+					t.Fatalf("descendant process %s remained after session cancellation", pid)
+				}
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("long output line did not finish within 5 seconds")
+}
+
+func TestSessionOutputDescendantHelper(t *testing.T) {
+	if os.Getenv("ROVER_SESSION_TEST_DESCENDANT") != "1" {
+		return
+	}
+	if pidFile := os.Getenv("ROVER_SESSION_TEST_PID_FILE"); pidFile != "" {
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+			t.Fatalf("write descendant pid: %v", err)
+		}
+	}
+	fmt.Println(strings.Repeat("x", 300000))
+	time.Sleep(30 * time.Second)
 }
 
 func TestSessionNotFound(t *testing.T) {

@@ -299,6 +299,7 @@ func (sm *SessionManager) execute(s *Session) {
 
 	shell, flag := platformShell()
 	cmd := exec.CommandContext(ctx, shell, flag, s.Command)
+	launcher.SetProcessGroup(cmd)
 	cmd.Env = childenv.Filter(os.Environ())
 
 	outPipe, err := cmd.StdoutPipe()
@@ -325,6 +326,12 @@ func (sm *SessionManager) execute(s *Session) {
 		s.broadcast(streamEvent{Type: "done"})
 		return
 	}
+	cmd.Cancel = func() error {
+		killErr := launcher.KillChildProcesses(cmd)
+		_ = outPipe.Close()
+		_ = errPipe.Close()
+		return killErr
+	}
 
 	if err := cmd.Start(); err != nil {
 		s.mu.Lock()
@@ -339,6 +346,7 @@ func (sm *SessionManager) execute(s *Session) {
 	}
 
 	done := make(chan struct{}, 2)
+	scanErrors := make(chan error, 2)
 	var outputBytes int64
 	var outputLimitHit atomic.Bool
 
@@ -365,41 +373,64 @@ func (sm *SessionManager) execute(s *Session) {
 				return
 			}
 		}
+		if err := sc.Err(); err != nil {
+			scanErrors <- fmt.Errorf("read %s: %w", kind, err)
+			cancel()
+		}
 	}
 
 	go scanPipe(outPipe, "stdout", &s.Stdout)
 	go scanPipe(errPipe, "stderr", &s.Stderr)
 	<-done
 	<-done
+	var scanErr error
+	select {
+	case scanErr = <-scanErrors:
+	default:
+	}
 
 	exitCode := 0
-	if err := cmd.Wait(); err != nil {
-		if outputLimitHit.Load() {
-			msg := fmt.Sprintf("\n[ROVER] Output limit exceeded (max %d bytes)\n", maxOutput)
-			s.mu.Lock()
-			s.Status = StatusFailed
-			s.Stderr += msg
-			now := time.Now()
-			s.EndTime = &now
-			s.ExitCode = -1
-			s.mu.Unlock()
-			s.broadcast(streamEvent{Type: "stderr", Data: msg})
-			s.broadcast(streamEvent{Type: "done", ExitCode: -1})
-			return
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			msg := fmt.Sprintf("\n[ROVER] Command timed out after %v\n", execTimeout)
-			s.mu.Lock()
-			s.Status = StatusFailed
-			s.Stderr += msg
-			now := time.Now()
-			s.EndTime = &now
-			s.ExitCode = -1
-			s.mu.Unlock()
-			s.broadcast(streamEvent{Type: "stderr", Data: msg})
-			s.broadcast(streamEvent{Type: "done", ExitCode: -1})
-			return
-		}
+	waitErr := cmd.Wait()
+	if outputLimitHit.Load() {
+		msg := fmt.Sprintf("\n[ROVER] Output limit exceeded (max %d bytes)\n", maxOutput)
+		s.mu.Lock()
+		s.Status = StatusFailed
+		s.Stderr += msg
+		now := time.Now()
+		s.EndTime = &now
+		s.ExitCode = -1
+		s.mu.Unlock()
+		s.broadcast(streamEvent{Type: "stderr", Data: msg})
+		s.broadcast(streamEvent{Type: "done", ExitCode: -1})
+		return
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		msg := fmt.Sprintf("\n[ROVER] Command timed out after %v\n", execTimeout)
+		s.mu.Lock()
+		s.Status = StatusFailed
+		s.Stderr += msg
+		now := time.Now()
+		s.EndTime = &now
+		s.ExitCode = -1
+		s.mu.Unlock()
+		s.broadcast(streamEvent{Type: "stderr", Data: msg})
+		s.broadcast(streamEvent{Type: "done", ExitCode: -1})
+		return
+	}
+	if scanErr != nil {
+		msg := fmt.Sprintf("\n[ROVER] Command output could not be read: %v\n", scanErr)
+		s.mu.Lock()
+		s.Status = StatusFailed
+		s.Stderr += msg
+		now := time.Now()
+		s.EndTime = &now
+		s.ExitCode = -1
+		s.mu.Unlock()
+		s.broadcast(streamEvent{Type: "stderr", Data: msg})
+		s.broadcast(streamEvent{Type: "done", ExitCode: -1})
+		return
+	}
+	if err := waitErr; err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
